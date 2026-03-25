@@ -27,7 +27,7 @@ struct SettingsView: View {
 
     private var generalTab: some View {
         Form {
-            Section("Permissions") {
+            Section {
                 permissionRow(
                     title: "Screen Recording",
                     isEnabled: viewModel.hasPermission,
@@ -42,28 +42,45 @@ struct SettingsView: View {
                     missingText: "Required for repeat capture and window resizing."
                 )
 
+                permissionRow(
+                    title: "Notifications",
+                    isEnabled: viewModel.hasNotificationPermission,
+                    readyText: "Ready to show capture completion alerts without interrupting the capture flow.",
+                    missingText: "Optional, but useful if you want completion alerts without a prompt appearing during capture."
+                )
+
                 HStack(spacing: 10) {
-                    Button("Request Screen Permission") {
-                        viewModel.requestPermission()
+                    Button("Open Guided Setup") {
+                        viewModel.presentPermissionOnboarding()
                     }
 
                     Button("Open Screen Settings") {
                         viewModel.openSystemSettings()
                     }
 
-                    Button("Request Accessibility") {
-                        viewModel.requestAccessibilityPermission()
-                    }
-
                     Button("Open Accessibility Settings") {
                         viewModel.openAccessibilitySettings()
                     }
 
-                    Button("Refresh Windows") {
-                        Task {
-                            await viewModel.loadWindows()
-                        }
+                    Button("Open Notification Settings") {
+                        viewModel.openNotificationSettings()
                     }
+                }
+            } header: {
+                HStack {
+                    Text("Permissions")
+
+                    Spacer(minLength: 0)
+
+                    Button {
+                        Task {
+                            await viewModel.handleAppDidBecomeActive()
+                        }
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .buttonStyle(.plain)
+                    .help("Refresh permission status")
                     .disabled(viewModel.isLoading)
                 }
             }

@@ -19,6 +19,30 @@ final class ContentViewModel: ObservableObject {
         static let stopAutomation: UInt32 = 2
     }
 
+    enum PermissionOnboardingStep: Int, CaseIterable, Identifiable {
+        case screenRecording
+        case accessibility
+        case notifications
+        case ready
+
+        var id: Int { rawValue }
+    }
+
+    enum NotificationPermissionState {
+        case notDetermined
+        case authorized
+        case denied
+
+        var isAuthorized: Bool {
+            self == .authorized
+        }
+    }
+
+    private enum UserDefaultsKey {
+        static let hasSeenPermissionOnboarding = "hasSeenPermissionOnboarding"
+        static let hasAcknowledgedNotificationOnboarding = "hasAcknowledgedNotificationOnboarding"
+    }
+
     @Published private(set) var windows: [WindowInfo] = []
     @Published var selectedWindowID: WindowInfo.ID? {
         didSet {
@@ -27,10 +51,14 @@ final class ContentViewModel: ObservableObject {
     }
     @Published private(set) var hasPermission = false
     @Published private(set) var hasAccessibilityPermission = false
+    @Published private(set) var notificationPermissionState: NotificationPermissionState = .notDetermined
+    @Published private(set) var hasAcknowledgedNotificationOnboarding = false
     @Published private(set) var isLoading = false
     @Published private(set) var isCapturing = false
     @Published private(set) var isResizingWindow = false
     @Published private(set) var isAutomating = false
+    @Published private(set) var isShowingPermissionOnboarding = false
+    @Published private(set) var activePermissionOnboardingStep: PermissionOnboardingStep = .screenRecording
     @Published private(set) var statusMessage = "Grant Screen Recording access, then refresh the list."
     @Published private(set) var statusColor = NSColor.secondaryLabelColor
     @Published private(set) var previewImage: NSImage?
@@ -61,14 +89,71 @@ final class ContentViewModel: ObservableObject {
         notificationManager = CaptureNotificationManager()
         hotKeyManager = GlobalHotKeyManager()
         saveFolderStore = SaveFolderStore()
+        hasAcknowledgedNotificationOnboarding = UserDefaults.standard.bool(forKey: UserDefaultsKey.hasAcknowledgedNotificationOnboarding)
         refreshPermissions()
+        isShowingPermissionOnboarding = shouldAutoPresentPermissionOnboarding()
+        syncPermissionOnboardingStep()
         restoreSavedFolder()
         restoreCaptureInsets()
         registerHotKeys()
+
+        Task { [weak self] in
+            await self?.refreshNotificationPermissionState()
+        }
     }
 
     var selectedWindow: WindowInfo? {
         windows.first(where: { $0.id == selectedWindowID })
+    }
+
+    var shouldShowPermissionBanner: Bool {
+        !isShowingPermissionOnboarding && (!hasPermission || !hasAccessibilityPermission)
+    }
+
+    var hasNotificationPermission: Bool {
+        notificationPermissionState.isAuthorized
+    }
+
+    var shouldShowNotificationOnboardingStep: Bool {
+        !hasNotificationPermission && !hasAcknowledgedNotificationOnboarding
+    }
+
+    var permissionOnboardingSteps: [PermissionOnboardingStep] {
+        var steps: [PermissionOnboardingStep] = []
+
+        if !hasPermission {
+            steps.append(.screenRecording)
+        }
+
+        if !hasAccessibilityPermission {
+            steps.append(.accessibility)
+        }
+
+        if shouldShowNotificationOnboardingStep {
+            steps.append(.notifications)
+        }
+
+        if steps.isEmpty {
+            steps.append(.ready)
+        }
+
+        return steps
+    }
+
+    var permissionOnboardingStepIndex: Int {
+        permissionOnboardingSteps.firstIndex(of: activePermissionOnboardingStep) ?? 0
+    }
+
+    var permissionOnboardingPageNumber: Int {
+        permissionOnboardingStepIndex + 1
+    }
+
+    var pendingPermissionOnboardingSteps: [PermissionOnboardingStep] {
+        guard permissionOnboardingStepIndex < permissionOnboardingSteps.count else {
+            return []
+        }
+
+        return Array(permissionOnboardingSteps.dropFirst(permissionOnboardingStepIndex + 1))
     }
 
     func loadWindows() async {
@@ -107,6 +192,7 @@ final class ContentViewModel: ObservableObject {
 
     func requestPermission() {
         hasPermission = captureService.requestScreenRecordingPermission()
+        syncPermissionOnboardingStep()
 
         if hasPermission {
             setStatus("Permission granted. Refresh the list to load capturable windows.", color: .systemGreen)
@@ -120,6 +206,7 @@ final class ContentViewModel: ObservableObject {
 
     func requestAccessibilityPermission() {
         hasAccessibilityPermission = captureService.requestAccessibilityPermission()
+        syncPermissionOnboardingStep()
 
         if hasAccessibilityPermission {
             setStatus("Accessibility permission granted. Automation can now send Right Arrow.", color: .systemGreen)
@@ -137,6 +224,31 @@ final class ContentViewModel: ObservableObject {
 
     func openAccessibilitySettings() {
         captureService.openAccessibilitySettings()
+    }
+
+    func openNotificationSettings() {
+        captureService.openNotificationSettings()
+    }
+
+    func requestNotificationPermission() async {
+        notificationPermissionState = await notificationManager.requestAuthorizationIfNeeded()
+
+        switch notificationPermissionState {
+        case .authorized:
+            acknowledgeNotificationOnboarding()
+            setStatus("Notification permission granted. Capture completion alerts can now appear without interrupting capture.", color: .systemGreen)
+        case .denied:
+            setStatus("Notification permission is off. You can still capture normally, or enable notifications later in System Settings.", color: .systemOrange)
+        case .notDetermined:
+            setStatus("Notification permission has not been decided yet.", color: .secondaryLabelColor)
+        }
+
+        syncPermissionOnboardingStep()
+    }
+
+    func skipNotificationOnboardingStep() {
+        acknowledgeNotificationOnboarding()
+        syncPermissionOnboardingStep()
     }
 
     func captureSelectedWindow() async {
@@ -263,6 +375,44 @@ final class ContentViewModel: ObservableObject {
         startAutomationFromHotKey()
     }
 
+    func presentPermissionOnboarding() {
+        isShowingPermissionOnboarding = true
+        activePermissionOnboardingStep = permissionOnboardingSteps.first ?? .ready
+        syncPermissionOnboardingStep()
+    }
+
+    func dismissPermissionOnboarding() {
+        UserDefaults.standard.set(true, forKey: UserDefaultsKey.hasSeenPermissionOnboarding)
+        isShowingPermissionOnboarding = false
+    }
+
+    func completePermissionOnboarding() async {
+        UserDefaults.standard.set(true, forKey: UserDefaultsKey.hasSeenPermissionOnboarding)
+        isShowingPermissionOnboarding = false
+
+        if hasPermission {
+            await loadWindows()
+        }
+    }
+
+    func handleAppDidBecomeActive() async {
+        let previousHasPermission = hasPermission
+        let previousHasAccessibilityPermission = hasAccessibilityPermission
+
+        refreshPermissions()
+        await refreshNotificationPermissionState()
+        if hasNotificationPermission {
+            acknowledgeNotificationOnboarding()
+        }
+        syncPermissionOnboardingStep()
+
+        if hasPermission && (!previousHasPermission || windows.isEmpty) {
+            await loadWindows()
+        } else if previousHasAccessibilityPermission != hasAccessibilityPermission {
+            objectWillChange.send()
+        }
+    }
+
     func stopAutomation() {
         guard let automationTask else {
             setStatus("No automation is running.", color: .secondaryLabelColor)
@@ -376,6 +526,11 @@ final class ContentViewModel: ObservableObject {
     private func refreshPermissions() {
         hasPermission = captureService.hasScreenRecordingPermission()
         hasAccessibilityPermission = captureService.hasAccessibilityPermission()
+    }
+
+    private func shouldAutoPresentPermissionOnboarding() -> Bool {
+        let hasSeenPermissionOnboarding = UserDefaults.standard.bool(forKey: UserDefaultsKey.hasSeenPermissionOnboarding)
+        return !hasSeenPermissionOnboarding && (!hasPermission || !hasAccessibilityPermission || shouldShowNotificationOnboardingStep)
     }
 
     private func restoreSavedFolder() {
@@ -510,6 +665,42 @@ final class ContentViewModel: ObservableObject {
         statusMessage = message
         statusColor = color
     }
+
+    private func refreshNotificationPermissionState() async {
+        notificationPermissionState = await notificationManager.authorizationState()
+    }
+
+    private func acknowledgeNotificationOnboarding() {
+        guard !hasAcknowledgedNotificationOnboarding else {
+            return
+        }
+
+        hasAcknowledgedNotificationOnboarding = true
+        UserDefaults.standard.set(true, forKey: UserDefaultsKey.hasAcknowledgedNotificationOnboarding)
+    }
+
+    private func syncPermissionOnboardingStep() {
+        guard isShowingPermissionOnboarding else {
+            return
+        }
+
+        let orderedSteps = permissionOnboardingSteps
+        guard !orderedSteps.isEmpty else {
+            activePermissionOnboardingStep = .ready
+            return
+        }
+
+        if orderedSteps.contains(activePermissionOnboardingStep) {
+            return
+        }
+
+        let currentOrder = activePermissionOnboardingStep.rawValue
+        if let nextAvailableStep = orderedSteps.first(where: { $0.rawValue >= currentOrder }) {
+            activePermissionOnboardingStep = nextAvailableStep
+        } else if let lastStep = orderedSteps.last {
+            activePermissionOnboardingStep = lastStep
+        }
+    }
 }
 
 private final class CaptureNotificationManager: NSObject, UNUserNotificationCenterDelegate {
@@ -545,7 +736,7 @@ private final class CaptureNotificationManager: NSObject, UNUserNotificationCent
     }
 
     private func postNotification(title: String, body: String) async {
-        guard await ensureAuthorization() else {
+        guard await authorizationState() == .authorized else {
             return
         }
 
@@ -567,22 +758,34 @@ private final class CaptureNotificationManager: NSObject, UNUserNotificationCent
         }
     }
 
-    private func ensureAuthorization() async -> Bool {
+    func authorizationState() async -> ContentViewModel.NotificationPermissionState {
         let settings = await notificationSettings()
 
         switch settings.authorizationStatus {
         case .authorized, .provisional, .ephemeral:
-            return true
+            return .authorized
+        case .notDetermined:
+            return .notDetermined
+        case .denied:
+            return .denied
+        @unknown default:
+            return .denied
+        }
+    }
+
+    func requestAuthorizationIfNeeded() async -> ContentViewModel.NotificationPermissionState {
+        switch await authorizationState() {
+        case .authorized:
+            return .authorized
+        case .denied:
+            return .denied
         case .notDetermined:
             do {
-                return try await requestAuthorization()
+                let granted = try await requestAuthorization()
+                return granted ? .authorized : .denied
             } catch {
-                return false
+                return .denied
             }
-        case .denied:
-            return false
-        @unknown default:
-            return false
         }
     }
 
