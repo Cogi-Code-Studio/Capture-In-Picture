@@ -1,0 +1,222 @@
+name: Release DMG
+
+on:
+  release:
+    types:
+      - published
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to upload the DMG to
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-dmg:
+    runs-on: macos-latest
+    env:
+      APP_NAME: CaptureInPicture
+      APP_DISPLAY_NAME: Capture In Picture
+      PROJECT_PATH: CaptureInPicture.xcodeproj
+      SCHEME: CaptureInPicture
+      EXPORT_OPTIONS_PLIST: .github/exportOptions/developer-id.plist
+      BUILD_CERTIFICATE_BASE64: ${{ secrets.BUILD_CERTIFICATE_BASE64 }}
+      P12_PASSWORD: ${{ secrets.P12_PASSWORD }}
+      KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+      APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Resolve release tag
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "${GITHUB_EVENT_NAME}" == "release" ]]; then
+            release_tag="${{ github.event.release.tag_name }}"
+          else
+            release_tag="${{ inputs.tag }}"
+          fi
+
+          release_version="${release_tag#v}"
+
+          echo "tag=${release_tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${release_version}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required_vars=(
+            BUILD_CERTIFICATE_BASE64
+            P12_PASSWORD
+            KEYCHAIN_PASSWORD
+            APP_STORE_CONNECT_KEY_ID
+            APP_STORE_CONNECT_ISSUER_ID
+            APP_STORE_CONNECT_PRIVATE_KEY
+          )
+
+          for var_name in "${required_vars[@]}"; do
+            if [[ -z "${!var_name:-}" ]]; then
+              echo "Missing required secret: ${var_name}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Show Xcode version
+        run: xcodebuild -version
+
+      - name: Import Developer ID certificate
+        id: keychain
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cert_path="$RUNNER_TEMP/developer-id.p12"
+          keychain_path="$RUNNER_TEMP/release-signing.keychain-db"
+
+          printf '%s' "$BUILD_CERTIFICATE_BASE64" | openssl base64 -d -A -out "$cert_path"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security set-keychain-settings -lut 21600 "$keychain_path"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$keychain_path"
+          security import "$cert_path" \
+            -k "$keychain_path" \
+            -P "$P12_PASSWORD" \
+            -T /usr/bin/codesign \
+            -T /usr/bin/security \
+            -T /usr/bin/xcodebuild
+          security list-keychains -d user -s "$keychain_path" login.keychain-db
+          security default-keychain -d user -s "$keychain_path"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$keychain_path"
+
+          developer_id_identity="$(security find-identity -v -p codesigning "$keychain_path" | grep "Developer ID Application" | head -n 1 | sed -E 's/.*"(.+)"/\1/')"
+
+          if [[ -z "$developer_id_identity" ]]; then
+            echo "Developer ID Application identity was not found in the imported keychain." >&2
+            exit 1
+          fi
+
+          echo "path=$keychain_path" >> "$GITHUB_OUTPUT"
+          echo "identity=$developer_id_identity" >> "$GITHUB_OUTPUT"
+
+      - name: Restore App Store Connect API key
+        id: api-key
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          api_key_path="$RUNNER_TEMP/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+          printf '%s' "$APP_STORE_CONNECT_PRIVATE_KEY" > "$api_key_path"
+          chmod 600 "$api_key_path"
+
+          echo "path=$api_key_path" >> "$GITHUB_OUTPUT"
+
+      - name: Archive app
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          archive_path="$RUNNER_TEMP/${APP_NAME}.xcarchive"
+
+          xcodebuild archive \
+            -project "$PROJECT_PATH" \
+            -scheme "$SCHEME" \
+            -configuration Release \
+            -destination "generic/platform=macOS" \
+            -archivePath "$archive_path" \
+            CODE_SIGN_STYLE=Manual \
+            CODE_SIGN_IDENTITY="${{ steps.keychain.outputs.identity }}" \
+            OTHER_CODE_SIGN_FLAGS="--keychain ${{ steps.keychain.outputs.path }}"
+
+      - name: Export signed app
+        id: export
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          archive_path="$RUNNER_TEMP/${APP_NAME}.xcarchive"
+          export_path="$RUNNER_TEMP/export"
+
+          xcodebuild -exportArchive \
+            -archivePath "$archive_path" \
+            -exportOptionsPlist "$EXPORT_OPTIONS_PLIST" \
+            -exportPath "$export_path" \
+            OTHER_CODE_SIGN_FLAGS="--keychain ${{ steps.keychain.outputs.path }}"
+
+          app_path="$export_path/${APP_NAME}.app"
+
+          if [[ ! -d "$app_path" ]]; then
+            echo "Expected exported app at $app_path" >&2
+            exit 1
+          fi
+
+          echo "app_path=$app_path" >> "$GITHUB_OUTPUT"
+
+      - name: Verify signature
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          codesign --verify --deep --strict --verbose=2 "${{ steps.export.outputs.app_path }}"
+          codesign --display --verbose=4 "${{ steps.export.outputs.app_path }}"
+
+      - name: Build DMG
+        id: dmg
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_tag="${{ steps.release.outputs.tag }}"
+          release_version="${{ steps.release.outputs.version }}"
+          dmg_root="$RUNNER_TEMP/dmg-root"
+          dmg_path="$RUNNER_TEMP/${APP_NAME}-${release_version}.dmg"
+          checksum_path="${dmg_path}.sha256"
+
+          rm -rf "$dmg_root"
+          mkdir -p "$dmg_root"
+          cp -R "${{ steps.export.outputs.app_path }}" "$dmg_root/"
+          ln -s /Applications "$dmg_root/Applications"
+
+          hdiutil create \
+            -volname "$APP_DISPLAY_NAME" \
+            -srcfolder "$dmg_root" \
+            -ov \
+            -format UDZO \
+            "$dmg_path"
+
+          xcrun notarytool submit "$dmg_path" \
+            --key "${{ steps.api-key.outputs.path }}" \
+            --key-id "$APP_STORE_CONNECT_KEY_ID" \
+            --issuer "$APP_STORE_CONNECT_ISSUER_ID" \
+            --wait
+
+          xcrun stapler staple "$dmg_path"
+          xcrun stapler validate "$dmg_path"
+          spctl -a -vv -t open "$dmg_path"
+          shasum -a 256 "$dmg_path" > "$checksum_path"
+
+          echo "path=$dmg_path" >> "$GITHUB_OUTPUT"
+          echo "checksum_path=$checksum_path" >> "$GITHUB_OUTPUT"
+          echo "asset_name=$(basename "$dmg_path")" >> "$GITHUB_OUTPUT"
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release upload "${{ steps.release.outputs.tag }}" \
+            "${{ steps.dmg.outputs.path }}" \
+            "${{ steps.dmg.outputs.checksum_path }}" \
+            --clobber
