@@ -59,6 +59,31 @@ Global shortcuts for repeat capture:
 - Start: `Control + Option + Command + S`
 - Stop: `Control + Option + Command + X`
 
+## Local Release Packaging
+
+If you want to build a notarized DMG locally before uploading it to GitHub Releases, use:
+
+```bash
+APP_STORE_CONNECT_KEY_ID=your_key_id \
+APP_STORE_CONNECT_ISSUER_ID=your_issuer_id \
+APP_STORE_CONNECT_PRIVATE_KEY_FILE=~/Keys/AuthKey_XXXXXX.p8 \
+./scripts/release-dmg.sh --tag v1.0.0
+```
+
+To upload the generated DMG to an existing GitHub release tag:
+
+```bash
+./scripts/release-dmg.sh --tag v1.0.0 --upload
+```
+
+To build a signed DMG without notarization:
+
+```bash
+./scripts/release-dmg.sh --version 1.0.0 --skip-notarize
+```
+
+The script expects a `Developer ID Application` certificate in your login keychain. If multiple identities exist, pass `--identity` or set `DEVELOPER_ID_IDENTITY`.
+
 ## FAQ
 
 ### Why does the app need Screen Recording permission?

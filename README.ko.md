@@ -59,6 +59,31 @@ Capture In Picture는 특정 앱 창만 골라 PNG로 저장할 수 있는 macOS
 - 시작: `Control + Option + Command + S`
 - 중지: `Control + Option + Command + X`
 
+## 로컬 릴리즈 패키징
+
+GitHub Releases에 올리기 전에 로컬에서 notarized DMG를 만들고 싶다면 아래처럼 실행하면 됩니다.
+
+```bash
+APP_STORE_CONNECT_KEY_ID=your_key_id \
+APP_STORE_CONNECT_ISSUER_ID=your_issuer_id \
+APP_STORE_CONNECT_PRIVATE_KEY_FILE=~/Keys/AuthKey_XXXXXX.p8 \
+./scripts/release-dmg.sh --tag v1.0.0
+```
+
+생성한 DMG를 기존 GitHub release 태그에 바로 업로드하려면:
+
+```bash
+./scripts/release-dmg.sh --tag v1.0.0 --upload
+```
+
+노타리제이션 없이 서명된 DMG만 먼저 만들고 싶다면:
+
+```bash
+./scripts/release-dmg.sh --version 1.0.0 --skip-notarize
+```
+
+이 스크립트는 로그인 키체인에 `Developer ID Application` 인증서가 있다고 가정합니다. 같은 종류의 인증서가 여러 개 있으면 `--identity` 또는 `DEVELOPER_ID_IDENTITY`로 명시해 주세요.
+
 ## 자주 묻는 질문
 
 ### 왜 화면 기록 권한이 필요한가요?
