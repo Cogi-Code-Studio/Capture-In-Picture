@@ -17,6 +17,7 @@ permissions:
 jobs:
   build-dmg:
     runs-on: macos-latest
+    timeout-minutes: 45
     env:
       APP_NAME: CaptureInPicture
       APP_DISPLAY_NAME: Capture In Picture
@@ -171,17 +172,15 @@ jobs:
           codesign --verify --deep --strict --verbose=2 "${{ steps.export.outputs.app_path }}"
           codesign --display --verbose=4 "${{ steps.export.outputs.app_path }}"
 
-      - name: Build DMG
+      - name: Create DMG
         id: dmg
         shell: bash
         run: |
           set -euo pipefail
 
-          release_tag="${{ steps.release.outputs.tag }}"
           release_version="${{ steps.release.outputs.version }}"
           dmg_root="$RUNNER_TEMP/dmg-root"
           dmg_path="$RUNNER_TEMP/${APP_NAME}-${release_version}.dmg"
-          checksum_path="${dmg_path}.sha256"
 
           rm -rf "$dmg_root"
           mkdir -p "$dmg_root"
@@ -195,21 +194,116 @@ jobs:
             -format UDZO \
             "$dmg_path"
 
-          xcrun notarytool submit "$dmg_path" \
+          echo "path=$dmg_path" >> "$GITHUB_OUTPUT"
+          echo "asset_name=$(basename "$dmg_path")" >> "$GITHUB_OUTPUT"
+
+      - name: Submit for notarization
+        id: notary-submit
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          submission_json="$RUNNER_TEMP/notary-submit.json"
+
+          xcrun notarytool submit "${{ steps.dmg.outputs.path }}" \
             --key "${{ steps.api-key.outputs.path }}" \
             --key-id "$APP_STORE_CONNECT_KEY_ID" \
             --issuer "$APP_STORE_CONNECT_ISSUER_ID" \
-            --wait
+            --output-format json \
+            > "$submission_json"
+
+          cat "$submission_json"
+
+          submission_id="$(ruby -rjson -e 'data = JSON.parse(File.read(ARGV[0])); print(data["id"] || data["submissionId"] || "")' "$submission_json")"
+
+          if [[ -z "$submission_id" ]]; then
+            echo "Unable to determine notarization submission id." >&2
+            exit 1
+          fi
+
+          echo "Submitted notarization request: $submission_id"
+          echo "submission_id=$submission_id" >> "$GITHUB_OUTPUT"
+
+      - name: Wait for notarization
+        id: notary-wait
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          submission_id="${{ steps.notary-submit.outputs.submission_id }}"
+          max_attempts=60
+          sleep_seconds=30
+          accepted=""
+
+          for attempt in $(seq 1 "$max_attempts"); do
+            status_json="$RUNNER_TEMP/notary-status.json"
+
+            xcrun notarytool info "$submission_id" \
+              --key "${{ steps.api-key.outputs.path }}" \
+              --key-id "$APP_STORE_CONNECT_KEY_ID" \
+              --issuer "$APP_STORE_CONNECT_ISSUER_ID" \
+              --output-format json \
+              > "$status_json"
+
+            status="$(ruby -rjson -e 'data = JSON.parse(File.read(ARGV[0])); print(data["status"] || data["Status"] || "")' "$status_json")"
+            message="$(ruby -rjson -e 'data = JSON.parse(File.read(ARGV[0])); print(data["statusSummary"] || data["message"] || data["Status Summary"] || "")' "$status_json")"
+
+            echo "Notarization attempt ${attempt}/${max_attempts}: ${status:-unknown}${message:+ - $message}"
+
+            if [[ "$status" == "Accepted" ]]; then
+              accepted="yes"
+              break
+            fi
+
+            if [[ "$status" == "Invalid" || "$status" == "Rejected" ]]; then
+              echo "Notarization failed with status: $status" >&2
+              echo "Fetching notarization log for $submission_id"
+              xcrun notarytool log "$submission_id" \
+                --key "${{ steps.api-key.outputs.path }}" \
+                --key-id "$APP_STORE_CONNECT_KEY_ID" \
+                --issuer "$APP_STORE_CONNECT_ISSUER_ID"
+              exit 1
+            fi
+
+            sleep "$sleep_seconds"
+          done
+
+          if [[ -z "$accepted" ]]; then
+            echo "Timed out waiting for notarization after $((max_attempts * sleep_seconds / 60)) minutes." >&2
+            echo "Submission ID: $submission_id" >&2
+            exit 1
+          fi
+
+      - name: Staple and validate DMG
+        id: notarized-dmg
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dmg_path="${{ steps.dmg.outputs.path }}"
+          checksum_path="${dmg_path}.sha256"
 
           xcrun stapler staple "$dmg_path"
           xcrun stapler validate "$dmg_path"
           spctl -a -vv -t open "$dmg_path"
           shasum -a 256 "$dmg_path" > "$checksum_path"
 
-          echo "path=$dmg_path" >> "$GITHUB_OUTPUT"
           echo "checksum_path=$checksum_path" >> "$GITHUB_OUTPUT"
-          echo "asset_name=$(basename "$dmg_path")" >> "$GITHUB_OUTPUT"
-          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch notarization log on failure
+        if: failure() && steps.notary-submit.outputs.submission_id != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          submission_id="${{ steps.notary-submit.outputs.submission_id }}"
+          echo "Attempting to fetch notarization log for failed submission $submission_id"
+
+          xcrun notarytool log "$submission_id" \
+            --key "${{ steps.api-key.outputs.path }}" \
+            --key-id "$APP_STORE_CONNECT_KEY_ID" \
+            --issuer "$APP_STORE_CONNECT_ISSUER_ID" \
+            || true
 
       - name: Upload release assets
         shell: bash
@@ -218,5 +312,5 @@ jobs:
 
           gh release upload "${{ steps.release.outputs.tag }}" \
             "${{ steps.dmg.outputs.path }}" \
-            "${{ steps.dmg.outputs.checksum_path }}" \
+            "${{ steps.notarized-dmg.outputs.checksum_path }}" \
             --clobber
