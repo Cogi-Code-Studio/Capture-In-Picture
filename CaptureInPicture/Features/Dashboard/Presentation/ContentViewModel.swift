@@ -38,9 +38,19 @@ final class ContentViewModel: ObservableObject {
         }
     }
 
+    enum AppUpdateStatus: Equatable {
+        case idle
+        case checking
+        case upToDate(latestVersion: String)
+        case updateAvailable(latestVersion: String)
+        case unavailable(reason: String)
+    }
+
     private enum UserDefaultsKey {
         static let hasSeenPermissionOnboarding = "hasSeenPermissionOnboarding"
         static let hasAcknowledgedNotificationOnboarding = "hasAcknowledgedNotificationOnboarding"
+        static let automationMacroSteps = "automationMacroSteps"
+        static let automationStartWithCapture = "automationStartWithCapture"
     }
 
     @Published private(set) var windows: [WindowInfo] = []
@@ -53,6 +63,7 @@ final class ContentViewModel: ObservableObject {
     @Published private(set) var hasAccessibilityPermission = false
     @Published private(set) var notificationPermissionState: NotificationPermissionState = .notDetermined
     @Published private(set) var hasAcknowledgedNotificationOnboarding = false
+    @Published private(set) var appUpdateStatus: AppUpdateStatus = .idle
     @Published private(set) var isLoading = false
     @Published private(set) var isCapturing = false
     @Published private(set) var isResizingWindow = false
@@ -66,6 +77,12 @@ final class ContentViewModel: ObservableObject {
     @Published private(set) var lastAutomationFolderURL: URL?
     @Published private(set) var selectedSaveFolderURL: URL?
     @Published var automationCaptureCountText = "5"
+    @Published var macroSteps: [AutomationMacroStep] = []
+    @Published var startWithCapture = false {
+        didSet {
+            persistStartWithCapturePreference()
+        }
+    }
     @Published var captureInsetTopText = "0"
     @Published var captureInsetLeftText = "0"
     @Published var captureInsetBottomText = "0"
@@ -80,21 +97,24 @@ final class ContentViewModel: ObservableObject {
     private let notificationManager: CaptureNotificationManager
     private let hotKeyManager: GlobalHotKeyManager
     private let saveFolderStore: SaveFolderStore
-    private let automationStepDelaySeconds = 0.6
+    private let appSupportService: AppSupportService
     private var automationTask: Task<Void, Never>?
 
-    init(captureService: WindowCaptureService? = nil) {
+    init(captureService: WindowCaptureService? = nil, appSupportService: AppSupportService? = nil) {
         let resolvedCaptureService = captureService ?? WindowCaptureService()
         self.captureService = resolvedCaptureService
         notificationManager = CaptureNotificationManager()
         hotKeyManager = GlobalHotKeyManager()
         saveFolderStore = SaveFolderStore()
+        self.appSupportService = appSupportService ?? AppSupportService()
         hasAcknowledgedNotificationOnboarding = UserDefaults.standard.bool(forKey: UserDefaultsKey.hasAcknowledgedNotificationOnboarding)
         refreshPermissions()
         isShowingPermissionOnboarding = shouldAutoPresentPermissionOnboarding()
         syncPermissionOnboardingStep()
         restoreSavedFolder()
         restoreCaptureInsets()
+        restoreMacroSteps()
+        restoreStartWithCapturePreference()
         registerHotKeys()
 
         Task { [weak self] in
@@ -106,12 +126,58 @@ final class ContentViewModel: ObservableObject {
         windows.first(where: { $0.id == selectedWindowID })
     }
 
+    var automationFlowSummary: String {
+        let stepSummaries = macroSteps.map(\.shortSummary)
+
+        if stepSummaries.isEmpty {
+            return startWithCapture
+                ? "Start Capture -> Add a Capture step in Settings > Macro."
+                : "No macro steps yet. Add a Capture step in Settings > Macro."
+        }
+
+        let summaries = startWithCapture ? ["Start Capture"] + stepSummaries : stepSummaries
+        return summaries.joined(separator: " -> ")
+    }
+
+    var automationMacroStepCountDescription: String {
+        let stepCount = macroSteps.count
+        let captureStepCount = macroSteps.filter(\.isCapture).count
+        let stepLabel = stepCount == 1 ? "step" : "steps"
+        let captureLabel = captureStepCount == 1 ? "capture node" : "capture nodes"
+        let startCaptureDescription = startWithCapture ? " · starts with capture" : ""
+        return "\(stepCount) \(stepLabel) · \(captureStepCount) \(captureLabel)\(startCaptureDescription)"
+    }
+
     var shouldShowPermissionBanner: Bool {
         !isShowingPermissionOnboarding && (!hasPermission || !hasAccessibilityPermission)
     }
 
+    var hasRequiredPermissions: Bool {
+        hasPermission && hasAccessibilityPermission
+    }
+
+    var canDismissPermissionOnboarding: Bool {
+        hasRequiredPermissions
+    }
+
+    var shouldShowPermissionGate: Bool {
+        !hasRequiredPermissions || isShowingPermissionOnboarding
+    }
+
     var hasNotificationPermission: Bool {
         notificationPermissionState.isAuthorized
+    }
+
+    var installedAppVersion: String {
+        appSupportService.installedVersion().versionDisplayName
+    }
+
+    var installedAppBuild: String {
+        appSupportService.installedVersion().buildDisplayName
+    }
+
+    var supportEmailAddress: String {
+        appSupportService.supportEmailAddress
     }
 
     var shouldShowNotificationOnboardingStep: Bool {
@@ -209,7 +275,7 @@ final class ContentViewModel: ObservableObject {
         syncPermissionOnboardingStep()
 
         if hasAccessibilityPermission {
-            setStatus("Accessibility permission granted. Automation can now send Right Arrow.", color: .systemGreen)
+            setStatus("Accessibility permission granted. Automation can now control the selected app window.", color: .systemGreen)
         } else {
             setStatus(
                 "If macOS did not grant access immediately, enable Accessibility for this app in System Settings.",
@@ -288,6 +354,58 @@ final class ContentViewModel: ObservableObject {
         automationCaptureCountText = "\(count)"
     }
 
+    func addMacroStep(_ kind: AutomationMacroStep.Kind, before destinationStepID: AutomationMacroStep.ID? = nil) {
+        insertMacroStep(AutomationMacroStep(kind: kind), before: destinationStepID)
+        setStatus("\(kind.title) added to the macro flow.", color: .secondaryLabelColor)
+    }
+
+    func moveMacroStep(_ stepID: AutomationMacroStep.ID, before destinationStepID: AutomationMacroStep.ID?) {
+        guard stepID != destinationStepID else {
+            return
+        }
+
+        guard let sourceIndex = macroSteps.firstIndex(where: { $0.id == stepID }) else {
+            return
+        }
+
+        let movedStep = macroSteps.remove(at: sourceIndex)
+        let destinationIndex = resolvedMacroInsertionIndex(before: destinationStepID)
+        macroSteps.insert(movedStep, at: destinationIndex)
+        persistMacroSteps()
+    }
+
+    func removeMacroStep(_ stepID: AutomationMacroStep.ID) {
+        guard let index = macroSteps.firstIndex(where: { $0.id == stepID }) else {
+            return
+        }
+
+        let removedStep = macroSteps.remove(at: index)
+        persistMacroSteps()
+        setStatus("\(removedStep.kind.title) removed from the macro flow.", color: .secondaryLabelColor)
+    }
+
+    func clearMacroSteps() {
+        macroSteps = []
+        persistMacroSteps()
+        setStatus("Macro flow cleared.", color: .secondaryLabelColor)
+    }
+
+    func resetMacroSteps() {
+        startWithCapture = true
+        macroSteps = AutomationMacroStep.defaultFlow
+        persistMacroSteps()
+        setStatus("Macro flow reset to the default capture sequence.", color: .secondaryLabelColor)
+    }
+
+    func updateMacroWaitDuration(for stepID: AutomationMacroStep.ID, seconds: Double) {
+        guard let index = macroSteps.firstIndex(where: { $0.id == stepID }) else {
+            return
+        }
+
+        macroSteps[index].waitDuration = min(max(seconds, 0.1), AutomationMacroStep.maxWaitDuration)
+        persistMacroSteps()
+    }
+
     func normalizeCaptureInsets() {
         _ = normalizedCaptureInsets()
     }
@@ -364,10 +482,22 @@ final class ContentViewModel: ObservableObject {
         }
 
         let cropInsets = normalizedCaptureInsets()
+        let configuredMacroSteps = macroSteps
+        let shouldStartWithCapture = startWithCapture
         automationCaptureCountText = "\(captureCount)"
 
+        guard configuredMacroSteps.contains(where: \.isCapture) else {
+            setStatus("Add at least one Capture step in Settings > Macro before starting repeat capture.", color: .systemOrange)
+            return
+        }
+
         automationTask = Task { [weak self] in
-            await self?.runAutomation(captureCount: captureCount, cropInsets: cropInsets)
+            await self?.runAutomation(
+                captureCount: captureCount,
+                cropInsets: cropInsets,
+                macroSteps: configuredMacroSteps,
+                startWithCapture: shouldStartWithCapture
+            )
         }
     }
 
@@ -382,11 +512,31 @@ final class ContentViewModel: ObservableObject {
     }
 
     func dismissPermissionOnboarding() {
+        guard canDismissPermissionOnboarding else {
+            setStatus(
+                "Screen Recording and Accessibility permissions are required before entering the capture studio.",
+                color: .systemOrange
+            )
+            isShowingPermissionOnboarding = true
+            syncPermissionOnboardingStep()
+            return
+        }
+
         UserDefaults.standard.set(true, forKey: UserDefaultsKey.hasSeenPermissionOnboarding)
         isShowingPermissionOnboarding = false
     }
 
     func completePermissionOnboarding() async {
+        guard canDismissPermissionOnboarding else {
+            setStatus(
+                "Screen Recording and Accessibility permissions are required before entering the capture studio.",
+                color: .systemOrange
+            )
+            isShowingPermissionOnboarding = true
+            syncPermissionOnboardingStep()
+            return
+        }
+
         UserDefaults.standard.set(true, forKey: UserDefaultsKey.hasSeenPermissionOnboarding)
         isShowingPermissionOnboarding = false
 
@@ -423,7 +573,12 @@ final class ContentViewModel: ObservableObject {
         setStatus("Stopping automation...", color: .systemOrange)
     }
 
-    private func runAutomation(captureCount: Int, cropInsets: CaptureInsets) async {
+    private func runAutomation(
+        captureCount: Int,
+        cropInsets: CaptureInsets,
+        macroSteps: [AutomationMacroStep],
+        startWithCapture: Bool
+    ) async {
         guard let selectedWindow else {
             setStatus("Select a window first.", color: .systemOrange)
             automationTask = nil
@@ -454,7 +609,8 @@ final class ContentViewModel: ObservableObject {
             let output = try await captureService.runAutomation(
                 window: selectedWindow,
                 captureCount: captureCount,
-                stepDelaySeconds: automationStepDelaySeconds,
+                macroSteps: macroSteps,
+                startWithCapture: startWithCapture,
                 preferredFolderURL: selectedSaveFolderURL,
                 cropInsets: cropInsets
             )
@@ -523,6 +679,37 @@ final class ContentViewModel: ObservableObject {
         }
     }
 
+    func checkForAppUpdates() async {
+        appUpdateStatus = .checking
+
+        let result = await appSupportService.checkForUpdates()
+        switch result {
+        case .upToDate(let latestVersion):
+            appUpdateStatus = .upToDate(latestVersion: latestVersion)
+            setStatus("You're on the latest published version (\(latestVersion)).", color: .systemGreen)
+        case .updateAvailable(let latestVersion):
+            appUpdateStatus = .updateAvailable(latestVersion: latestVersion)
+            setStatus("A newer version (\(latestVersion)) is available.", color: .systemOrange)
+        case .unavailable(let reason):
+            appUpdateStatus = .unavailable(reason: reason)
+            setStatus(reason, color: .secondaryLabelColor)
+        }
+    }
+
+    func sendSupportEmail(_ kind: SupportEmailKind) {
+        guard appSupportService.openSupportEmail(kind) else {
+            setStatus("The mail app could not be opened.", color: .systemRed)
+            return
+        }
+
+        switch kind {
+        case .feedback:
+            setStatus("Feedback email opened in your default mail app.", color: .systemGreen)
+        case .bugReport:
+            setStatus("Bug report email opened in your default mail app.", color: .systemGreen)
+        }
+    }
+
     private func refreshPermissions() {
         hasPermission = captureService.hasScreenRecordingPermission()
         hasAccessibilityPermission = captureService.hasAccessibilityPermission()
@@ -530,7 +717,7 @@ final class ContentViewModel: ObservableObject {
 
     private func shouldAutoPresentPermissionOnboarding() -> Bool {
         let hasSeenPermissionOnboarding = UserDefaults.standard.bool(forKey: UserDefaultsKey.hasSeenPermissionOnboarding)
-        return !hasSeenPermissionOnboarding && (!hasPermission || !hasAccessibilityPermission || shouldShowNotificationOnboardingStep)
+        return !hasSeenPermissionOnboarding && !hasRequiredPermissions
     }
 
     private func restoreSavedFolder() {
@@ -550,6 +737,30 @@ final class ContentViewModel: ObservableObject {
             right: CGFloat(UserDefaults.standard.integer(forKey: "captureInsetRight"))
         )
         applyCaptureInsets(captureInsets)
+    }
+
+    private func restoreMacroSteps() {
+        guard let storedData = UserDefaults.standard.data(forKey: UserDefaultsKey.automationMacroSteps) else {
+            macroSteps = AutomationMacroStep.defaultFlow
+            persistMacroSteps()
+            return
+        }
+
+        do {
+            macroSteps = try JSONDecoder().decode([AutomationMacroStep].self, from: storedData)
+        } catch {
+            macroSteps = AutomationMacroStep.defaultFlow
+            persistMacroSteps()
+            setStatus("The saved macro could not be read, so the default flow was restored.", color: .systemOrange)
+        }
+    }
+
+    private func restoreStartWithCapturePreference() {
+        if UserDefaults.standard.object(forKey: UserDefaultsKey.automationStartWithCapture) == nil {
+            startWithCapture = true
+        } else {
+            startWithCapture = UserDefaults.standard.bool(forKey: UserDefaultsKey.automationStartWithCapture)
+        }
     }
 
     private func registerHotKeys() {
@@ -636,6 +847,35 @@ final class ContentViewModel: ObservableObject {
         UserDefaults.standard.set(Int(captureInsets.right), forKey: "captureInsetRight")
     }
 
+    private func insertMacroStep(_ step: AutomationMacroStep, before destinationStepID: AutomationMacroStep.ID?) {
+        let destinationIndex = resolvedMacroInsertionIndex(before: destinationStepID)
+        macroSteps.insert(step, at: destinationIndex)
+        persistMacroSteps()
+    }
+
+    private func resolvedMacroInsertionIndex(before destinationStepID: AutomationMacroStep.ID?) -> Int {
+        guard
+            let destinationStepID,
+            let destinationIndex = macroSteps.firstIndex(where: { $0.id == destinationStepID })
+        else {
+            return macroSteps.endIndex
+        }
+
+        return destinationIndex
+    }
+
+    private func persistMacroSteps() {
+        guard let encodedSteps = try? JSONEncoder().encode(macroSteps) else {
+            return
+        }
+
+        UserDefaults.standard.set(encodedSteps, forKey: UserDefaultsKey.automationMacroSteps)
+    }
+
+    private func persistStartWithCapturePreference() {
+        UserDefaults.standard.set(startWithCapture, forKey: UserDefaultsKey.automationStartWithCapture)
+    }
+
     private func syncWindowSizeInputsFromSelection() {
         guard let selectedWindow else {
             windowWidthText = ""
@@ -680,10 +920,6 @@ final class ContentViewModel: ObservableObject {
     }
 
     private func syncPermissionOnboardingStep() {
-        guard isShowingPermissionOnboarding else {
-            return
-        }
-
         let orderedSteps = permissionOnboardingSteps
         guard !orderedSteps.isEmpty else {
             activePermissionOnboardingStep = .ready

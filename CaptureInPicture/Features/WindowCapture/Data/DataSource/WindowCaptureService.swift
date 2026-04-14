@@ -24,13 +24,14 @@ enum WindowCaptureError: LocalizedError {
     case targetApplicationUnavailable
     case keyboardEventCreationFailed
     case invalidAutomationCount
+    case automationMacroMissingCaptureStep
 
     var errorDescription: String? {
         switch self {
         case .permissionDenied:
             return "Screen Recording permission is required to list and capture other apps."
         case .accessibilityPermissionDenied:
-            return "Accessibility permission is required to focus another app and send Right Arrow."
+            return "Accessibility permission is required to focus another app and send macro key input."
         case .noWindowsAvailable:
             return "There are no capturable windows right now."
         case .saveCancelled:
@@ -44,21 +45,24 @@ enum WindowCaptureError: LocalizedError {
         case .windowResizeUnavailable:
             return "The selected window cannot be resized."
         case .windowResizeFailed:
-            return "The app could not resize the selected window."
+            return "The selected window did not accept the new size. Refresh the list and try again."
         case .targetApplicationUnavailable:
-            return "The selected app is no longer available for automation."
+            return "The selected window could not be matched for automation. Refresh the list and select it again."
         case .keyboardEventCreationFailed:
-            return "The app could not create the Right Arrow key event."
+            return "The app could not create the keyboard event for the macro step."
         case .invalidAutomationCount:
             return "Automation capture count must be at least 1."
+        case .automationMacroMissingCaptureStep:
+            return "Add at least one Capture step to the macro flow before starting repeat capture."
         }
     }
 }
 
 @MainActor
 final class WindowCaptureService {
-    private let rightArrowKeyCode: CGKeyCode = 124
     private let axResizableAttribute = "AXResizable" as CFString
+    private let windowMatchTolerance: CGFloat = 6
+    private let resizeVerificationTolerance: CGFloat = 2
 
     func hasScreenRecordingPermission() -> Bool {
         CGPreflightScreenCaptureAccess()
@@ -137,12 +141,17 @@ final class WindowCaptureService {
     func runAutomation(
         window: WindowInfo,
         captureCount: Int,
-        stepDelaySeconds: Double,
+        macroSteps: [AutomationMacroStep],
+        startWithCapture: Bool,
         preferredFolderURL: URL?,
         cropInsets: CaptureInsets
     ) async throws -> AutomationRunOutput {
         guard captureCount > 0 else {
             throw WindowCaptureError.invalidAutomationCount
+        }
+
+        guard macroSteps.contains(where: \.isCapture) else {
+            throw WindowCaptureError.automationMacroMissingCaptureStep
         }
 
         guard hasScreenRecordingPermission() else {
@@ -153,31 +162,65 @@ final class WindowCaptureService {
             throw WindowCaptureError.accessibilityPermissionDenied
         }
 
-        let delaySeconds = max(stepDelaySeconds, 0.1)
         let outputFolderURL = try createAutomationFolder(for: window, preferredFolderURL: preferredFolderURL)
         var savedFiles: [URL] = []
         var lastImage: NSImage?
+        var nextCaptureIndex = 1
+        var shouldSkipFirstCaptureStep = false
 
         try Task.checkCancellation()
         try await focusTarget(window: window)
-        try await sleep(seconds: delaySeconds)
 
-        for index in 1...captureCount {
-            try Task.checkCancellation()
-            let image = try await captureImage(for: window, cropInsets: cropInsets)
-            let destinationURL = outputFolderURL.appendingPathComponent(
-                automationFileName(for: window, index: index),
-                conformingTo: .png
+        if startWithCapture {
+            let output = try await saveAutomationCapture(
+                for: window,
+                cropInsets: cropInsets,
+                outputFolderURL: outputFolderURL,
+                index: nextCaptureIndex
             )
+            savedFiles.append(output.fileURL)
+            lastImage = output.image
+            nextCaptureIndex += 1
+            shouldSkipFirstCaptureStep = true
 
-            try save(image: image, to: destinationURL)
-            savedFiles.append(destinationURL)
-            lastImage = image
+            if savedFiles.count >= captureCount {
+                return AutomationRunOutput(
+                    lastImage: lastImage,
+                    folderURL: outputFolderURL,
+                    fileURLs: savedFiles
+                )
+            }
+        }
 
-            if index < captureCount {
+        automationLoop: while savedFiles.count < captureCount {
+            for step in macroSteps {
                 try Task.checkCancellation()
-                try sendRightArrow(to: window)
-                try await sleep(seconds: delaySeconds)
+
+                switch step.kind {
+                case .capture:
+                    if shouldSkipFirstCaptureStep {
+                        shouldSkipFirstCaptureStep = false
+                        continue
+                    }
+
+                    let output = try await saveAutomationCapture(
+                        for: window,
+                        cropInsets: cropInsets,
+                        outputFolderURL: outputFolderURL,
+                        index: nextCaptureIndex
+                    )
+                    savedFiles.append(output.fileURL)
+                    lastImage = output.image
+                    nextCaptureIndex += 1
+
+                    if savedFiles.count >= captureCount {
+                        break automationLoop
+                    }
+                case .wait:
+                    try await sleep(seconds: step.resolvedWaitDuration)
+                case .up, .down, .left, .right:
+                    try sendDirectionalKey(step.kind, to: window)
+                }
             }
         }
 
@@ -186,6 +229,22 @@ final class WindowCaptureService {
             folderURL: outputFolderURL,
             fileURLs: savedFiles
         )
+    }
+
+    private func saveAutomationCapture(
+        for window: WindowInfo,
+        cropInsets: CaptureInsets,
+        outputFolderURL: URL,
+        index: Int
+    ) async throws -> CaptureOutput {
+        let image = try await captureImage(for: window, cropInsets: cropInsets)
+        let destinationURL = outputFolderURL.appendingPathComponent(
+            automationFileName(for: window, index: index),
+            conformingTo: .png
+        )
+
+        try save(image: image, to: destinationURL)
+        return CaptureOutput(image: image, fileURL: destinationURL)
     }
 
     func resizeWindow(_ window: WindowInfo, to size: CGSize) async throws -> CGSize {
@@ -210,6 +269,8 @@ final class WindowCaptureService {
             throw WindowCaptureError.windowResizeUnavailable
         }
 
+        let originalSize = copyCGSizeAttribute(kAXSizeAttribute as CFString, from: axWindow)
+
         var requestedSize = size
         guard let sizeValue = AXValueCreate(.cgSize, &requestedSize) else {
             throw WindowCaptureError.windowResizeFailed
@@ -218,8 +279,18 @@ final class WindowCaptureService {
         let resizeResult = AXUIElementSetAttributeValue(axWindow, kAXSizeAttribute as CFString, sizeValue)
         switch resizeResult {
         case .success:
-            try await sleep(seconds: 0.15)
-            return copyCGSizeAttribute(kAXSizeAttribute as CFString, from: axWindow) ?? requestedSize
+            try await sleep(seconds: 0.3)
+            let appliedSize = copyCGSizeAttribute(kAXSizeAttribute as CFString, from: axWindow) ?? requestedSize
+
+            if sizeMatches(appliedSize, requestedSize, tolerance: resizeVerificationTolerance) {
+                return appliedSize
+            }
+
+            if let originalSize, sizeMatches(appliedSize, originalSize, tolerance: resizeVerificationTolerance) {
+                throw WindowCaptureError.windowResizeFailed
+            }
+
+            return appliedSize
         case .attributeUnsupported:
             throw WindowCaptureError.windowResizeUnavailable
         default:
@@ -300,7 +371,7 @@ final class WindowCaptureService {
         try await sleep(seconds: 0.25)
 
         guard let axWindow = matchingAXWindow(for: window, pid: pid) else {
-            return
+            throw WindowCaptureError.targetApplicationUnavailable
         }
 
         _ = AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
@@ -308,14 +379,28 @@ final class WindowCaptureService {
         _ = AXUIElementSetAttributeValue(axWindow, kAXFocusedAttribute as CFString, kCFBooleanTrue)
     }
 
-    private func sendRightArrow(to window: WindowInfo) throws {
+    private func sendDirectionalKey(_ direction: AutomationMacroStep.Kind, to window: WindowInfo) throws {
         guard let pid = window.processID else {
             throw WindowCaptureError.targetApplicationUnavailable
         }
 
+        let keyCode: CGKeyCode
+        switch direction {
+        case .up:
+            keyCode = 126
+        case .down:
+            keyCode = 125
+        case .left:
+            keyCode = 123
+        case .right:
+            keyCode = 124
+        case .wait, .capture:
+            return
+        }
+
         guard
-            let keyDownEvent = CGEvent(keyboardEventSource: nil, virtualKey: rightArrowKeyCode, keyDown: true),
-            let keyUpEvent = CGEvent(keyboardEventSource: nil, virtualKey: rightArrowKeyCode, keyDown: false)
+            let keyDownEvent = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: true),
+            let keyUpEvent = CGEvent(keyboardEventSource: nil, virtualKey: keyCode, keyDown: false)
         else {
             throw WindowCaptureError.keyboardEventCreationFailed
         }
@@ -338,16 +423,50 @@ final class WindowCaptureService {
         let expectedTitle = window.rawWindow.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let expectedFrame = window.rawWindow.frame
 
-        return axWindows.first { axWindow in
+        let scoredWindows = axWindows.compactMap { axWindow -> (AXUIElement, Int)? in
             let axTitle = copyStringAttribute(kAXTitleAttribute as CFString, from: axWindow) ?? ""
-            let frameMatches = copyFrame(from: axWindow).map { approximatelyEqual($0, expectedFrame) } ?? false
+            let axFrame = copyFrame(from: axWindow)
+            let titleMatches = !expectedTitle.isEmpty && axTitle == expectedTitle
+            let frameMatches = axFrame.map { approximatelyEqual($0, expectedFrame, tolerance: windowMatchTolerance) } ?? false
+            let originMatches = axFrame.map {
+                pointApproximatelyEqual($0.origin, expectedFrame.origin, tolerance: windowMatchTolerance)
+            } ?? false
+            let sizeMatch = axFrame.map {
+                sizeMatches($0.size, expectedFrame.size, tolerance: windowMatchTolerance)
+            } ?? false
 
-            if !expectedTitle.isEmpty, axTitle == expectedTitle {
-                return true
+            var score = 0
+            if titleMatches {
+                score += 4
+            }
+            if frameMatches {
+                score += 6
+            } else {
+                if originMatches {
+                    score += 2
+                }
+                if sizeMatch {
+                    score += 2
+                }
             }
 
-            return frameMatches
-        } ?? axWindows.first
+            guard score > 0 else {
+                return nil
+            }
+
+            return (axWindow, score)
+        }
+
+        return scoredWindows
+            .sorted { lhs, rhs in
+                if lhs.1 == rhs.1 {
+                    return copyBoolAttribute(kAXMainAttribute as CFString, from: lhs.0) == true
+                }
+
+                return lhs.1 > rhs.1
+            }
+            .first?
+            .0
     }
 
     private func copyStringAttribute(_ attribute: CFString, from element: AXUIElement) -> String? {
@@ -425,11 +544,19 @@ final class WindowCaptureService {
         return size
     }
 
-    private func approximatelyEqual(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
-        abs(lhs.origin.x - rhs.origin.x) < 4 &&
-        abs(lhs.origin.y - rhs.origin.y) < 4 &&
-        abs(lhs.size.width - rhs.size.width) < 4 &&
-        abs(lhs.size.height - rhs.size.height) < 4
+    private func approximatelyEqual(_ lhs: CGRect, _ rhs: CGRect, tolerance: CGFloat) -> Bool {
+        pointApproximatelyEqual(lhs.origin, rhs.origin, tolerance: tolerance) &&
+        sizeMatches(lhs.size, rhs.size, tolerance: tolerance)
+    }
+
+    private func pointApproximatelyEqual(_ lhs: CGPoint, _ rhs: CGPoint, tolerance: CGFloat) -> Bool {
+        abs(lhs.x - rhs.x) <= tolerance &&
+        abs(lhs.y - rhs.y) <= tolerance
+    }
+
+    private func sizeMatches(_ lhs: CGSize, _ rhs: CGSize, tolerance: CGFloat) -> Bool {
+        abs(lhs.width - rhs.width) <= tolerance &&
+        abs(lhs.height - rhs.height) <= tolerance
     }
 
     private func cropImage(_ image: CGImage, using insets: CaptureInsets, scale: CGFloat) throws -> CGImage {
