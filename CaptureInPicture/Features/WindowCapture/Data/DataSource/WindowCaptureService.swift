@@ -61,7 +61,10 @@ enum WindowCaptureError: LocalizedError {
 @MainActor
 final class WindowCaptureService {
     private let axResizableAttribute = "AXResizable" as CFString
-    private let windowMatchTolerance: CGFloat = 6
+    private let windowFrameMatchTolerance: CGFloat = 20
+    private let windowOriginMatchTolerance: CGFloat = 40
+    private let windowSizeMatchTolerance: CGFloat = 80
+    private let windowCenterMatchTolerance: CGFloat = 140
     private let resizeVerificationTolerance: CGFloat = 2
 
     func hasScreenRecordingPermission() -> Bool {
@@ -169,7 +172,7 @@ final class WindowCaptureService {
         var shouldSkipFirstCaptureStep = false
 
         try Task.checkCancellation()
-        try await focusTarget(window: window)
+        _ = try await focusTarget(window: window)
 
         if startWithCapture {
             let output = try await saveAutomationCapture(
@@ -256,14 +259,7 @@ final class WindowCaptureService {
             throw WindowCaptureError.accessibilityPermissionDenied
         }
 
-        try await focusTarget(window: window)
-
-        guard
-            let pid = window.processID,
-            let axWindow = matchingAXWindow(for: window, pid: pid)
-        else {
-            throw WindowCaptureError.targetApplicationUnavailable
-        }
+        let axWindow = try await focusTarget(window: window)
 
         if let isResizable = copyBoolAttribute(axResizableAttribute, from: axWindow), !isResizable {
             throw WindowCaptureError.windowResizeUnavailable
@@ -359,7 +355,7 @@ final class WindowCaptureService {
         try data.write(to: url)
     }
 
-    private func focusTarget(window: WindowInfo) async throws {
+    private func focusTarget(window: WindowInfo) async throws -> AXUIElement {
         guard
             let pid = window.processID,
             let runningApplication = NSRunningApplication(processIdentifier: pid)
@@ -368,7 +364,7 @@ final class WindowCaptureService {
         }
 
         runningApplication.activate(options: [.activateAllWindows])
-        try await sleep(seconds: 0.25)
+        try await sleep(seconds: 0.4)
 
         guard let axWindow = matchingAXWindow(for: window, pid: pid) else {
             throw WindowCaptureError.targetApplicationUnavailable
@@ -377,6 +373,8 @@ final class WindowCaptureService {
         _ = AXUIElementPerformAction(axWindow, kAXRaiseAction as CFString)
         _ = AXUIElementSetAttributeValue(axWindow, kAXMainAttribute as CFString, kCFBooleanTrue)
         _ = AXUIElementSetAttributeValue(axWindow, kAXFocusedAttribute as CFString, kCFBooleanTrue)
+        try await sleep(seconds: 0.1)
+        return axWindow
     }
 
     private func sendDirectionalKey(_ direction: AutomationMacroStep.Kind, to window: WindowInfo) throws {
@@ -411,62 +409,95 @@ final class WindowCaptureService {
 
     private func matchingAXWindow(for window: WindowInfo, pid: pid_t) -> AXUIElement? {
         let appElement = AXUIElementCreateApplication(pid)
-        var windowValue: CFTypeRef?
+        let axWindows = copyAXWindowCandidates(from: appElement)
 
-        guard
-            AXUIElementCopyAttributeValue(appElement, kAXWindowsAttribute as CFString, &windowValue) == .success,
-            let axWindows = windowValue as? [AXUIElement]
-        else {
+        guard !axWindows.isEmpty else {
             return nil
         }
 
-        let expectedTitle = window.rawWindow.title?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let expectedTitle = normalizedWindowTitle(window.rawWindow.title)
         let expectedFrame = window.rawWindow.frame
 
-        let scoredWindows = axWindows.compactMap { axWindow -> (AXUIElement, Int)? in
-            let axTitle = copyStringAttribute(kAXTitleAttribute as CFString, from: axWindow) ?? ""
-            let axFrame = copyFrame(from: axWindow)
-            let titleMatches = !expectedTitle.isEmpty && axTitle == expectedTitle
-            let frameMatches = axFrame.map { approximatelyEqual($0, expectedFrame, tolerance: windowMatchTolerance) } ?? false
-            let originMatches = axFrame.map {
-                pointApproximatelyEqual($0.origin, expectedFrame.origin, tolerance: windowMatchTolerance)
-            } ?? false
-            let sizeMatch = axFrame.map {
-                sizeMatches($0.size, expectedFrame.size, tolerance: windowMatchTolerance)
-            } ?? false
+        let scoredWindows = axWindows.compactMap { axWindow -> AXWindowMatchCandidate? in
+            let candidate = AXWindowMatchCandidate(
+                element: axWindow,
+                title: normalizedWindowTitle(copyStringAttribute(kAXTitleAttribute as CFString, from: axWindow)),
+                frame: copyFrame(from: axWindow),
+                isMain: copyBoolAttribute(kAXMainAttribute as CFString, from: axWindow) == true,
+                isFocused: copyBoolAttribute(kAXFocusedAttribute as CFString, from: axWindow) == true,
+                isStandardWindow: copyStringAttribute(kAXSubroleAttribute as CFString, from: axWindow) == (kAXStandardWindowSubrole as String),
+                isResizable: copyBoolAttribute(axResizableAttribute, from: axWindow)
+            )
 
-            var score = 0
-            if titleMatches {
-                score += 4
-            }
-            if frameMatches {
-                score += 6
-            } else {
-                if originMatches {
-                    score += 2
-                }
-                if sizeMatch {
-                    score += 2
-                }
-            }
-
+            let score = score(axWindow: candidate, expectedTitle: expectedTitle, expectedFrame: expectedFrame)
             guard score > 0 else {
                 return nil
             }
 
-            return (axWindow, score)
+            return candidate.with(score: score)
         }
 
-        return scoredWindows
-            .sorted { lhs, rhs in
-                if lhs.1 == rhs.1 {
-                    return copyBoolAttribute(kAXMainAttribute as CFString, from: lhs.0) == true
-                }
+        if let bestMatch = scoredWindows
+            .sorted(by: compareWindowCandidates(lhs:rhs:))
+            .first(where: { $0.score >= 30 }) {
+            return bestMatch.element
+        }
 
-                return lhs.1 > rhs.1
-            }
-            .first?
-            .0
+        let standardWindows = scoredWindows.filter(\.isStandardWindow)
+        if standardWindows.count == 1 {
+            return standardWindows[0].element
+        }
+
+        return nil
+    }
+
+    private func copyAXWindowCandidates(from appElement: AXUIElement) -> [AXUIElement] {
+        var candidates: [AXUIElement] = []
+
+        appendUnique(copyElementArrayAttribute(kAXWindowsAttribute as CFString, from: appElement) ?? [], into: &candidates)
+
+        if let focusedWindow = copyElementAttribute(kAXFocusedWindowAttribute as CFString, from: appElement) {
+            appendUnique([focusedWindow], into: &candidates)
+        }
+
+        if let mainWindow = copyElementAttribute(kAXMainWindowAttribute as CFString, from: appElement) {
+            appendUnique([mainWindow], into: &candidates)
+        }
+
+        return candidates
+    }
+
+    private func appendUnique(_ elements: [AXUIElement], into candidates: inout [AXUIElement]) {
+        for element in elements where !candidates.contains(where: { CFEqual($0, element) }) {
+            candidates.append(element)
+        }
+    }
+
+    private func copyElementAttribute(_ attribute: CFString, from element: AXUIElement) -> AXUIElement? {
+        var value: CFTypeRef?
+
+        guard
+            AXUIElementCopyAttributeValue(element, attribute, &value) == .success,
+            let axElement = value,
+            CFGetTypeID(axElement) == AXUIElementGetTypeID()
+        else {
+            return nil
+        }
+
+        return unsafeBitCast(axElement, to: AXUIElement.self)
+    }
+
+    private func copyElementArrayAttribute(_ attribute: CFString, from element: AXUIElement) -> [AXUIElement]? {
+        var value: CFTypeRef?
+
+        guard
+            AXUIElementCopyAttributeValue(element, attribute, &value) == .success,
+            let axElements = value as? [AXUIElement]
+        else {
+            return nil
+        }
+
+        return axElements
     }
 
     private func copyStringAttribute(_ attribute: CFString, from element: AXUIElement) -> String? {
@@ -557,6 +588,89 @@ final class WindowCaptureService {
     private func sizeMatches(_ lhs: CGSize, _ rhs: CGSize, tolerance: CGFloat) -> Bool {
         abs(lhs.width - rhs.width) <= tolerance &&
         abs(lhs.height - rhs.height) <= tolerance
+    }
+
+    private func normalizedWindowTitle(_ value: String?) -> String {
+        guard let value else {
+            return ""
+        }
+
+        return value
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+    }
+
+    private func score(axWindow candidate: AXWindowMatchCandidate, expectedTitle: String, expectedFrame: CGRect) -> Int {
+        var score = 0
+
+        if candidate.isStandardWindow {
+            score += 10
+        }
+
+        if candidate.isResizable == true {
+            score += 6
+        }
+
+        if candidate.isMain {
+            score += 10
+        }
+
+        if candidate.isFocused {
+            score += 12
+        }
+
+        if !expectedTitle.isEmpty {
+            if candidate.title == expectedTitle {
+                score += 70
+            } else if candidate.title.contains(expectedTitle) || expectedTitle.contains(candidate.title) {
+                score += 35
+            }
+        }
+
+        guard let frame = candidate.frame else {
+            return score
+        }
+
+        if approximatelyEqual(frame, expectedFrame, tolerance: windowFrameMatchTolerance) {
+            score += 60
+        } else {
+            if pointApproximatelyEqual(frame.origin, expectedFrame.origin, tolerance: windowOriginMatchTolerance) {
+                score += 18
+            }
+
+            if sizeMatches(frame.size, expectedFrame.size, tolerance: 20) {
+                score += 30
+            } else if sizeMatches(frame.size, expectedFrame.size, tolerance: windowSizeMatchTolerance) {
+                score += 16
+            }
+
+            let centerDistance = hypot(frame.midX - expectedFrame.midX, frame.midY - expectedFrame.midY)
+            if centerDistance <= windowCenterMatchTolerance {
+                score += 12
+            }
+        }
+
+        return score
+    }
+
+    private func compareWindowCandidates(lhs: AXWindowMatchCandidate, rhs: AXWindowMatchCandidate) -> Bool {
+        if lhs.score != rhs.score {
+            return lhs.score > rhs.score
+        }
+
+        if lhs.isFocused != rhs.isFocused {
+            return lhs.isFocused && !rhs.isFocused
+        }
+
+        if lhs.isMain != rhs.isMain {
+            return lhs.isMain && !rhs.isMain
+        }
+
+        if lhs.isStandardWindow != rhs.isStandardWindow {
+            return lhs.isStandardWindow && !rhs.isStandardWindow
+        }
+
+        return false
     }
 
     private func cropImage(_ image: CGImage, using insets: CaptureInsets, scale: CGFloat) throws -> CGImage {
@@ -667,6 +781,50 @@ final class WindowCaptureService {
         }
 
         return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+    }
+}
+
+private struct AXWindowMatchCandidate {
+    let element: AXUIElement
+    let title: String
+    let frame: CGRect?
+    let isMain: Bool
+    let isFocused: Bool
+    let isStandardWindow: Bool
+    let isResizable: Bool?
+    let score: Int
+
+    init(
+        element: AXUIElement,
+        title: String,
+        frame: CGRect?,
+        isMain: Bool,
+        isFocused: Bool,
+        isStandardWindow: Bool,
+        isResizable: Bool?,
+        score: Int = 0
+    ) {
+        self.element = element
+        self.title = title
+        self.frame = frame
+        self.isMain = isMain
+        self.isFocused = isFocused
+        self.isStandardWindow = isStandardWindow
+        self.isResizable = isResizable
+        self.score = score
+    }
+
+    func with(score: Int) -> AXWindowMatchCandidate {
+        AXWindowMatchCandidate(
+            element: element,
+            title: title,
+            frame: frame,
+            isMain: isMain,
+            isFocused: isFocused,
+            isStandardWindow: isStandardWindow,
+            isResizable: isResizable,
+            score: score
+        )
     }
 }
 
