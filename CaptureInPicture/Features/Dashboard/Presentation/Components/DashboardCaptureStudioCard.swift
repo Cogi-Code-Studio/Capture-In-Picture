@@ -4,20 +4,17 @@ struct DashboardCaptureStudioCard: View {
     @ObservedObject var viewModel: ContentViewModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Capture Studio")
-                    .font(.title2.weight(.semibold))
+        VStack(alignment: .leading, spacing: 18) {
+            Text("Capture Controls")
+                .font(.title3.weight(.semibold))
 
-                Text("Tune the window size, choose the repeat count, then run a single test capture or a repeated capture session.")
-                    .foregroundStyle(.secondary)
-            }
+            primaryActions
 
             VStack(alignment: .leading, spacing: 12) {
-                Text("Window Size")
+                Label("Window Size", systemImage: "arrow.up.left.and.arrow.down.right")
                     .font(.headline)
 
-                HStack(spacing: 12) {
+                HStack(spacing: 10) {
                     DashboardMetricField(title: "Width", text: $viewModel.windowWidthText) {
                         viewModel.normalizeWindowSize()
                     }
@@ -27,8 +24,8 @@ struct DashboardCaptureStudioCard: View {
                     }
                 }
 
-                HStack(spacing: 10) {
-                    Button("Load Current Size") {
+                HStack(spacing: 8) {
+                    Button("Load") {
                         viewModel.useSelectedWindowSize()
                     }
                     .disabled(viewModel.selectedWindow == nil)
@@ -38,7 +35,7 @@ struct DashboardCaptureStudioCard: View {
                             await viewModel.resizeSelectedWindow()
                         }
                     } label: {
-                        Label(viewModel.isResizingWindow ? "Applying..." : "Apply Size", systemImage: "arrow.up.left.and.arrow.down.right")
+                        Label(viewModel.isResizingWindow ? "Applying..." : "Apply", systemImage: "checkmark")
                     }
                     .buttonStyle(.borderedProminent)
                     .disabled(
@@ -49,64 +46,56 @@ struct DashboardCaptureStudioCard: View {
                     )
                 }
             }
+        }
+        .controlSize(.small)
+        .dashboardCard()
+    }
 
-            Divider()
-
-            VStack(alignment: .leading, spacing: 12) {
-                Text("Repeat Capture")
-                    .font(.headline)
-
-                HStack(spacing: 12) {
-                    DashboardMetricField(title: "Count", text: $viewModel.automationCaptureCountText) {
-                        viewModel.normalizeAutomationCaptureCount()
-                    }
-
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text("Flow")
-                            .font(.caption.weight(.semibold))
-                            .foregroundStyle(.secondary)
-
-                        Text(viewModel.automationFlowSummary)
-                            .font(.subheadline)
-                            .foregroundStyle(.secondary)
-                            .fixedSize(horizontal: false, vertical: true)
-                    }
+    private var primaryActions: some View {
+        VStack(spacing: 10) {
+            Button {
+                Task {
+                    await viewModel.captureSelectedWindow()
                 }
-
-                if !viewModel.hasAccessibilityPermission {
-                    Label("Accessibility permission is still required for repeat capture and resizing.", systemImage: "exclamationmark.triangle.fill")
-                        .font(.subheadline)
-                        .foregroundStyle(.orange)
-                }
-
-                VStack(alignment: .leading, spacing: 8) {
-                    Text("Shortcuts")
-                        .font(.caption.weight(.semibold))
-                        .foregroundStyle(.secondary)
-
-                    Label(viewModel.automationStartShortcutDescription, systemImage: "play.circle")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-
-                    Label(viewModel.automationStopShortcutDescription, systemImage: "stop.circle")
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                }
+            } label: {
+                DashboardActionButtonLabel(
+                    title: viewModel.isCapturing ? "Capturing..." : "Try One Capture",
+                    subtitle: "Save the current window as a PNG right now.",
+                    systemImage: "camera.aperture"
+                )
             }
+            .buttonStyle(.borderedProminent)
+            .controlSize(.large)
+            .disabled(
+                viewModel.selectedWindow == nil ||
+                viewModel.isCapturing ||
+                viewModel.isAutomating ||
+                !viewModel.hasPermission
+            )
 
-            VStack(spacing: 12) {
+            if viewModel.isAutomating {
                 Button {
-                    Task {
-                        await viewModel.captureSelectedWindow()
-                    }
+                    viewModel.stopAutomation()
                 } label: {
                     DashboardActionButtonLabel(
-                        title: viewModel.isCapturing ? "Capturing..." : "Try One Capture",
-                        subtitle: "Save the current window as a PNG right now.",
-                        systemImage: "camera.aperture"
+                        title: "Stop Repeat Capture",
+                        subtitle: "End the current automated session.",
+                        systemImage: "stop.circle"
                     )
                 }
-                .buttonStyle(.borderedProminent)
+                .buttonStyle(.bordered)
+                .controlSize(.large)
+            } else {
+                Button {
+                    viewModel.startAutomation()
+                } label: {
+                    DashboardActionButtonLabel(
+                        title: "Start Repeat Capture",
+                        subtitle: "Run the selected window through the repeat workflow.",
+                        systemImage: "repeat.circle"
+                    )
+                }
+                .buttonStyle(.bordered)
                 .controlSize(.large)
                 .disabled(
                     viewModel.selectedWindow == nil ||
@@ -114,42 +103,10 @@ struct DashboardCaptureStudioCard: View {
                     viewModel.isAutomating ||
                     !viewModel.hasPermission
                 )
-
-                if viewModel.isAutomating {
-                    Button {
-                        viewModel.stopAutomation()
-                    } label: {
-                        DashboardActionButtonLabel(
-                            title: "Stop Repeat Capture",
-                            subtitle: "End the current automated session.",
-                            systemImage: "stop.circle"
-                        )
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.large)
-                } else {
-                    Button {
-                        viewModel.startAutomation()
-                    } label: {
-                        DashboardActionButtonLabel(
-                            title: "Start Repeat Capture",
-                            subtitle: "Run the selected window through the repeat workflow.",
-                            systemImage: "repeat.circle"
-                        )
-                    }
-                    .buttonStyle(.bordered)
-                    .controlSize(.large)
-                    .disabled(
-                        viewModel.selectedWindow == nil ||
-                        viewModel.isCapturing ||
-                        viewModel.isAutomating ||
-                        !viewModel.hasPermission
-                    )
-                }
             }
         }
-        .dashboardCard()
     }
+
 }
 
 private struct DashboardMetricField: View {

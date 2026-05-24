@@ -53,8 +53,7 @@ final class ContentViewModel: ObservableObject {
         static let automationStartWithCapture = "automationStartWithCapture"
     }
 
-    @Published private(set) var windows: [WindowInfo] = []
-    @Published var selectedWindowID: WindowInfo.ID? {
+    @Published private(set) var selectedWindow: WindowInfo? {
         didSet {
             syncWindowSizeInputsFromSelection()
         }
@@ -65,13 +64,16 @@ final class ContentViewModel: ObservableObject {
     @Published private(set) var hasAcknowledgedNotificationOnboarding = false
     @Published private(set) var appUpdateStatus: AppUpdateStatus = .idle
     @Published private(set) var isLoading = false
+    @Published private(set) var isChoosingWindow = false
     @Published private(set) var isCapturing = false
     @Published private(set) var isResizingWindow = false
     @Published private(set) var isAutomating = false
     @Published private(set) var isShowingPermissionOnboarding = false
     @Published private(set) var activePermissionOnboardingStep: PermissionOnboardingStep = .screenRecording
-    @Published private(set) var statusMessage = "Grant Screen Recording access, then refresh the list."
+    @Published private(set) var statusMessage = "Grant Screen Recording access, then choose a window."
     @Published private(set) var statusColor = NSColor.secondaryLabelColor
+    @Published private(set) var targetPreviewImage: NSImage?
+    @Published private(set) var isTargetPreviewActive = false
     @Published private(set) var previewImage: NSImage?
     @Published private(set) var lastSavedURL: URL?
     @Published private(set) var lastAutomationFolderURL: URL?
@@ -99,6 +101,7 @@ final class ContentViewModel: ObservableObject {
     private let saveFolderStore: SaveFolderStore
     private let appSupportService: AppSupportService
     private var automationTask: Task<Void, Never>?
+    private var targetPreviewID = UUID()
 
     init(captureService: WindowCaptureService? = nil, appSupportService: AppSupportService? = nil) {
         let resolvedCaptureService = captureService ?? WindowCaptureService()
@@ -120,10 +123,6 @@ final class ContentViewModel: ObservableObject {
         Task { [weak self] in
             await self?.refreshNotificationPermissionState()
         }
-    }
-
-    var selectedWindow: WindowInfo? {
-        windows.first(where: { $0.id == selectedWindowID })
     }
 
     var automationFlowSummary: String {
@@ -148,6 +147,18 @@ final class ContentViewModel: ObservableObject {
         return "\(stepCount) \(stepLabel) · \(captureStepCount) \(captureLabel)\(startCaptureDescription)"
     }
 
+    var captureInsetSummary: String {
+        "T\(captureInsetTopText) B\(captureInsetBottomText) L\(captureInsetLeftText) R\(captureInsetRightText)"
+    }
+
+    var repeatCaptureSummary: String {
+        automationCaptureCountText.isEmpty ? "0" : automationCaptureCountText
+    }
+
+    var saveLocationDisplayPath: String {
+        (resolvedSaveLocationURL.path as NSString).abbreviatingWithTildeInPath
+    }
+
     var shouldShowPermissionBanner: Bool {
         !isShowingPermissionOnboarding && (!hasPermission || !hasAccessibilityPermission)
     }
@@ -157,11 +168,11 @@ final class ContentViewModel: ObservableObject {
     }
 
     var canDismissPermissionOnboarding: Bool {
-        hasRequiredPermissions
+        true
     }
 
     var shouldShowPermissionGate: Bool {
-        !hasRequiredPermissions || isShowingPermissionOnboarding
+        false
     }
 
     var hasNotificationPermission: Bool {
@@ -229,8 +240,8 @@ final class ContentViewModel: ObservableObject {
         refreshPermissions()
 
         guard hasPermission else {
-            windows = []
-            selectedWindowID = nil
+            selectedWindow = nil
+            await stopTargetPreview()
             setStatus(
                 "Screen Recording permission is off. Use the button below to request access.",
                 color: .systemOrange
@@ -238,21 +249,20 @@ final class ContentViewModel: ObservableObject {
             return
         }
 
-        do {
-            let loadedWindows = try await captureService.fetchWindows()
-            windows = loadedWindows
-
-            if !loadedWindows.contains(where: { $0.id == selectedWindowID }) {
-                selectedWindowID = loadedWindows.first?.id
-            } else {
-                syncWindowSizeInputsFromSelection()
+        if let selectedWindow {
+            do {
+                let refreshedWindow = try await captureService.refreshWindow(selectedWindow)
+                self.selectedWindow = refreshedWindow
+                await startTargetPreview(for: refreshedWindow)
+                setStatus("Selected \(selectedWindow.appName): \(selectedWindow.title)", color: .systemGreen)
+            } catch {
+                self.selectedWindow = nil
+                await stopTargetPreview()
+                setStatus("Choose a window to capture.", color: .secondaryLabelColor)
             }
-
-            setStatus("Select a window and press Capture Screenshot.", color: .systemGreen)
-        } catch {
-            windows = []
-            selectedWindowID = nil
-            setStatus(error.localizedDescription, color: .systemRed)
+        } else {
+            await stopTargetPreview()
+            setStatus("Choose a window to capture.", color: .secondaryLabelColor)
         }
     }
 
@@ -261,7 +271,7 @@ final class ContentViewModel: ObservableObject {
         syncPermissionOnboardingStep()
 
         if hasPermission {
-            setStatus("Permission granted. Refresh the list to load capturable windows.", color: .systemGreen)
+            setStatus("Permission granted. Choose a window to capture.", color: .systemGreen)
         } else {
             setStatus(
                 "If macOS did not grant access immediately, enable Screen Recording for this app in System Settings and reopen it.",
@@ -458,14 +468,22 @@ final class ContentViewModel: ObservableObject {
         isResizingWindow = true
         defer { isResizingWindow = false }
 
+        await stopTargetPreview()
+
         do {
             let appliedSize = try await captureService.resizeWindow(selectedWindow, to: windowSize)
-            await loadWindows()
+            if let refreshedWindow = try? await captureService.refreshWindow(selectedWindow) {
+                self.selectedWindow = refreshedWindow
+                await startTargetPreview(for: refreshedWindow)
+            } else {
+                await startTargetPreview(for: selectedWindow)
+            }
             setStatus(
                 "Resized window to \(Int(appliedSize.width)) x \(Int(appliedSize.height)).",
                 color: .systemGreen
             )
         } catch {
+            await startTargetPreview(for: selectedWindow)
             setStatus(error.localizedDescription, color: .systemRed)
         }
     }
@@ -505,6 +523,30 @@ final class ContentViewModel: ObservableObject {
         startAutomationFromHotKey()
     }
 
+    func chooseWindow() async {
+        refreshPermissions()
+
+        guard hasPermission else {
+            setStatus(WindowCaptureError.permissionDenied.localizedDescription, color: .systemOrange)
+            return
+        }
+
+        isChoosingWindow = true
+        setStatus("Click the window you want to capture.", color: .secondaryLabelColor)
+        defer { isChoosingWindow = false }
+
+        do {
+            let chosenWindow = try await captureService.chooseWindow()
+            selectedWindow = chosenWindow
+            await startTargetPreview(for: chosenWindow)
+            setStatus("Selected \(chosenWindow.appName): \(chosenWindow.title)", color: .systemGreen)
+        } catch WindowCaptureError.windowPickerCancelled {
+            setStatus("Window selection cancelled.", color: .secondaryLabelColor)
+        } catch {
+            setStatus(error.localizedDescription, color: .systemRed)
+        }
+    }
+
     func presentPermissionOnboarding() {
         isShowingPermissionOnboarding = true
         activePermissionOnboardingStep = permissionOnboardingSteps.first ?? .ready
@@ -512,31 +554,11 @@ final class ContentViewModel: ObservableObject {
     }
 
     func dismissPermissionOnboarding() {
-        guard canDismissPermissionOnboarding else {
-            setStatus(
-                "Screen Recording and Accessibility permissions are required before entering the capture studio.",
-                color: .systemOrange
-            )
-            isShowingPermissionOnboarding = true
-            syncPermissionOnboardingStep()
-            return
-        }
-
         UserDefaults.standard.set(true, forKey: UserDefaultsKey.hasSeenPermissionOnboarding)
         isShowingPermissionOnboarding = false
     }
 
     func completePermissionOnboarding() async {
-        guard canDismissPermissionOnboarding else {
-            setStatus(
-                "Screen Recording and Accessibility permissions are required before entering the capture studio.",
-                color: .systemOrange
-            )
-            isShowingPermissionOnboarding = true
-            syncPermissionOnboardingStep()
-            return
-        }
-
         UserDefaults.standard.set(true, forKey: UserDefaultsKey.hasSeenPermissionOnboarding)
         isShowingPermissionOnboarding = false
 
@@ -556,7 +578,7 @@ final class ContentViewModel: ObservableObject {
         }
         syncPermissionOnboardingStep()
 
-        if hasPermission && (!previousHasPermission || windows.isEmpty) {
+        if hasPermission && !previousHasPermission {
             await loadWindows()
         } else if previousHasAccessibilityPermission != hasAccessibilityPermission {
             objectWillChange.send()
@@ -667,6 +689,17 @@ final class ContentViewModel: ObservableObject {
         NSWorkspace.shared.activateFileViewerSelecting([selectedSaveFolderURL])
     }
 
+    func openResolvedSaveLocation() {
+        let folderURL = resolvedSaveLocationURL
+
+        do {
+            try FileManager.default.createDirectory(at: folderURL, withIntermediateDirectories: true)
+            NSWorkspace.shared.activateFileViewerSelecting([folderURL])
+        } catch {
+            setStatus("Could not open save location: \(error.localizedDescription)", color: .systemRed)
+        }
+    }
+
     func copySaveLocationToClipboard() {
         let resolvedPath = resolvedSaveLocationURL.path
         let pasteboard = NSPasteboard.general
@@ -715,9 +748,40 @@ final class ContentViewModel: ObservableObject {
         hasAccessibilityPermission = captureService.hasAccessibilityPermission()
     }
 
+    private func startTargetPreview(for window: WindowInfo) async {
+        targetPreviewImage = nil
+        isTargetPreviewActive = false
+        let previewID = UUID()
+        targetPreviewID = previewID
+
+        do {
+            try await captureService.startLivePreview(for: window) { [weak self, previewID] image in
+                guard let self, targetPreviewID == previewID else {
+                    return
+                }
+
+                targetPreviewImage = image
+                isTargetPreviewActive = true
+            }
+        } catch {
+            guard targetPreviewID == previewID else {
+                return
+            }
+
+            isTargetPreviewActive = false
+            targetPreviewImage = nil
+        }
+    }
+
+    private func stopTargetPreview() async {
+        targetPreviewID = UUID()
+        targetPreviewImage = nil
+        isTargetPreviewActive = false
+        await captureService.stopLivePreview()
+    }
+
     private func shouldAutoPresentPermissionOnboarding() -> Bool {
-        let hasSeenPermissionOnboarding = UserDefaults.standard.bool(forKey: UserDefaultsKey.hasSeenPermissionOnboarding)
-        return !hasSeenPermissionOnboarding && !hasRequiredPermissions
+        false
     }
 
     private func restoreSavedFolder() {

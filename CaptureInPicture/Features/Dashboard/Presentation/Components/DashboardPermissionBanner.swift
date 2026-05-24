@@ -12,8 +12,8 @@ struct DashboardPermissionBanner: View {
                 DashboardPermissionBadge(
                     title: "Screen Recording",
                     isEnabled: viewModel.hasPermission,
-                    readyText: "Ready to list and capture app windows.",
-                    missingText: "Needed before any window appears in the main list."
+                    readyText: "Ready to choose and capture app windows.",
+                    missingText: "Needed before the macOS window picker can be used."
                 )
 
                 DashboardPermissionBadge(
@@ -49,7 +49,7 @@ struct DashboardPermissionBanner: View {
                     }
                 }
 
-                Button("Refresh Windows") {
+                Button("Refresh Status") {
                     Task {
                         await viewModel.loadWindows()
                     }

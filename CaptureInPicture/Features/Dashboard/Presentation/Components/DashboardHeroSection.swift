@@ -5,17 +5,9 @@ struct DashboardHeroSection: View {
     @ObservedObject var viewModel: ContentViewModel
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            HStack(alignment: .top, spacing: 20) {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Capture In Picture")
-                        .font(.system(size: 34, weight: .bold))
-
-                    Text("Keep the main flow focused: choose a window, set the size, decide how many frames to take, and capture right away.")
-                        .font(.title3)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
-                }
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .center, spacing: 18) {
+                headerSettingsSummary
 
                 Spacer(minLength: 0)
 
@@ -25,71 +17,90 @@ struct DashboardHeroSection: View {
                 )
             }
 
-            HStack(spacing: 12) {
-                DashboardHeroMetric(
-                    title: "Selected Window",
-                    value: selectedWindowTitle,
-                    systemImage: "macwindow"
+            HStack(alignment: .top, spacing: 10) {
+                DashboardReadyChip(
+                    title: "Screen",
+                    message: viewModel.hasPermission ? "Window capture ready" : "Needs Screen Recording",
+                    systemImage: "rectangle.on.rectangle",
+                    isReady: viewModel.hasPermission
                 )
 
-                DashboardHeroMetric(
-                    title: "Window Size",
-                    value: selectedWindowSize,
-                    systemImage: "arrow.up.left.and.arrow.down.right"
+                DashboardReadyChip(
+                    title: "Control",
+                    message: viewModel.hasAccessibilityPermission ? "Resize and macros ready" : "Needs Accessibility",
+                    systemImage: "keyboard",
+                    isReady: viewModel.hasAccessibilityPermission
                 )
 
-                DashboardHeroMetric(
-                    title: "Repeat Count",
-                    value: viewModel.automationCaptureCountText,
-                    systemImage: "repeat"
+                DashboardReadyChip(
+                    title: "Notify",
+                    message: viewModel.hasNotificationPermission ? "Completion alerts ready" : "Optional",
+                    systemImage: "bell",
+                    isReady: viewModel.hasNotificationPermission,
+                    isOptional: true
                 )
-            }
 
-            HStack(spacing: 12) {
-                DashboardHeroMetric(
-                    title: "Capture Insets",
-                    value: captureInsetsSummary,
-                    systemImage: "crop"
-                )
+                Spacer(minLength: 0)
+
+                if !viewModel.hasPermission {
+                    Button("Request Screen") {
+                        viewModel.requestPermission()
+                    }
+                }
+
+                if !viewModel.hasAccessibilityPermission {
+                    Button("Request Accessibility") {
+                        viewModel.requestAccessibilityPermission()
+                    }
+                }
+
+                if !viewModel.hasNotificationPermission {
+                    Button("Request Notifications") {
+                        Task {
+                            await viewModel.requestNotificationPermission()
+                        }
+                    }
+                }
 
                 Button {
-                    viewModel.copySaveLocationToClipboard()
+                    viewModel.presentPermissionOnboarding()
                 } label: {
-                    DashboardHeroMetric(
-                        title: "Save Location",
-                        value: saveLocationSummary,
-                        systemImage: "folder"
-                    )
+                    Label("Guided Setup", systemImage: "checklist")
                 }
-                .buttonStyle(.plain)
-                .help("Copy save location path")
             }
         }
-        .dashboardCard(highlighted: true)
+        .padding(.horizontal, 24)
+        .padding(.vertical, 18)
+        .background(.bar)
     }
 
-    private var selectedWindowTitle: String {
-        viewModel.selectedWindow?.title ?? "No window selected"
-    }
+    private var headerSettingsSummary: some View {
+        HStack(spacing: 10) {
+            DashboardHeaderInfoChip(
+                title: "Inset",
+                value: viewModel.captureInsetSummary,
+                systemImage: "crop"
+            )
 
-    private var selectedWindowSize: String {
-        if let selectedWindow = viewModel.selectedWindow {
-            return selectedWindow.sizeDescription
+            DashboardHeaderInfoChip(
+                title: "Repeat",
+                value: viewModel.repeatCaptureSummary,
+                systemImage: "repeat"
+            )
+
+            Button {
+                viewModel.openResolvedSaveLocation()
+            } label: {
+                DashboardHeaderInfoChip(
+                    title: "Location",
+                    value: viewModel.saveLocationDisplayPath,
+                    systemImage: "folder"
+                )
+            }
+            .buttonStyle(.plain)
+            .help("Open save location in Finder")
+            .frame(maxWidth: 420, alignment: .leading)
         }
-
-        if !viewModel.windowWidthText.isEmpty, !viewModel.windowHeightText.isEmpty {
-            return "\(viewModel.windowWidthText) x \(viewModel.windowHeightText)"
-        }
-
-        return "Use the controls below"
-    }
-
-    private var captureInsetsSummary: String {
-        "Top \(viewModel.captureInsetTopText)  Bottom \(viewModel.captureInsetBottomText)  Left \(viewModel.captureInsetLeftText)  Right \(viewModel.captureInsetRightText)"
-    }
-
-    private var saveLocationSummary: String {
-        viewModel.selectedSaveFolderURL?.path ?? "Pictures/CaptureInPicture"
     }
 }
 
@@ -101,45 +112,72 @@ private struct DashboardStatusPill: View {
         HStack(spacing: 10) {
             Circle()
                 .fill(Color(nsColor: statusColor))
-                .frame(width: 10, height: 10)
+                .frame(width: 8, height: 8)
 
             Text(statusMessage)
-                .font(.subheadline.weight(.medium))
+                .font(.subheadline)
                 .multilineTextAlignment(.leading)
-                .lineLimit(3)
+                .lineLimit(2)
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 12)
-        .background(.white.opacity(0.55), in: Capsule())
+        .padding(.horizontal, 12)
+        .padding(.vertical, 7)
+        .background(.regularMaterial, in: Capsule())
     }
 }
 
-private struct DashboardHeroMetric: View {
+private struct DashboardReadyChip: View {
+    let title: String
+    let message: String
+    let systemImage: String
+    let isReady: Bool
+    var isOptional = false
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: systemImage)
+                .foregroundStyle(isReady ? .green : (isOptional ? .secondary : .orange))
+                .frame(width: 16)
+
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title)
+                    .font(.caption.weight(.semibold))
+
+                Text(message)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+}
+
+private struct DashboardHeaderInfoChip: View {
     let title: String
     let value: String
     let systemImage: String
 
     var body: some View {
-        HStack(spacing: 12) {
+        HStack(spacing: 8) {
             Image(systemName: systemImage)
-                .font(.title3)
-                .foregroundStyle(Color.accentColor)
-                .frame(width: 26)
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
 
-            VStack(alignment: .leading, spacing: 4) {
+            VStack(alignment: .leading, spacing: 1) {
                 Text(title)
                     .font(.caption.weight(.semibold))
-                    .foregroundStyle(.secondary)
 
                 Text(value)
-                    .font(.headline)
-                    .lineLimit(3)
-                    .fixedSize(horizontal: false, vertical: true)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
             }
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 16)
-        .padding(.vertical, 14)
-        .background(Color.white.opacity(0.42), in: RoundedRectangle(cornerRadius: 20, style: .continuous))
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
     }
 }

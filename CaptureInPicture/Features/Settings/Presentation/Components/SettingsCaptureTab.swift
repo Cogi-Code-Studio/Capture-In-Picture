@@ -37,6 +37,20 @@ struct SettingsCaptureTab: View {
                     Text("Repeat capture follows the Macro tab flow and stops after it has saved the requested number of Capture steps.")
                         .foregroundStyle(.secondary)
 
+                    HStack {
+                        Text("Repeat Count")
+
+                        Spacer()
+
+                        TextField("0", text: $viewModel.automationCaptureCountText)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 90)
+                            .multilineTextAlignment(.trailing)
+                            .onSubmit {
+                                viewModel.normalizeAutomationCaptureCount()
+                            }
+                    }
+
                     Label(viewModel.automationFlowSummary, systemImage: "square.stack.3d.up")
                     Label(viewModel.automationStartShortcutDescription, systemImage: "play.circle")
                     Label(viewModel.automationStopShortcutDescription, systemImage: "stop.circle")

@@ -2,9 +2,6 @@ import SwiftUI
 
 struct SettingsSupportTab: View {
     @ObservedObject var viewModel: ContentViewModel
-    @State private var isShowingPrivacyPolicy = false
-
-    private let privacyPolicy = PrivacyPolicyDocument.current
 
     var body: some View {
         Form {
@@ -78,21 +75,8 @@ struct SettingsSupportTab: View {
                         .textSelection(.enabled)
                 }
             }
-
-            Section(privacyPolicy.title) {
-                Text(privacyPolicy.summary)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                Button(privacyPolicy.viewButtonTitle) {
-                    isShowingPrivacyPolicy = true
-                }
-            }
         }
         .formStyle(.grouped)
-        .sheet(isPresented: $isShowingPrivacyPolicy) {
-            PrivacyPolicyView()
-        }
     }
 
     private var isCheckingForUpdates: Bool {

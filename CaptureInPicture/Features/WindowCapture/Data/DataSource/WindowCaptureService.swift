@@ -7,6 +7,8 @@
 
 import AppKit
 import ApplicationServices
+import CoreImage
+import CoreMedia
 import CoreGraphics
 import ScreenCaptureKit
 import UniformTypeIdentifiers
@@ -25,11 +27,14 @@ enum WindowCaptureError: LocalizedError {
     case keyboardEventCreationFailed
     case invalidAutomationCount
     case automationMacroMissingCaptureStep
+    case windowPickerAlreadyActive
+    case windowPickerCancelled
+    case windowPickerSelectionUnavailable
 
     var errorDescription: String? {
         switch self {
         case .permissionDenied:
-            return "Screen Recording permission is required to list and capture other apps."
+            return "Screen Recording permission is required to choose and capture other app windows."
         case .accessibilityPermissionDenied:
             return "Accessibility permission is required to focus another app and send macro key input."
         case .noWindowsAvailable:
@@ -45,15 +50,21 @@ enum WindowCaptureError: LocalizedError {
         case .windowResizeUnavailable:
             return "The selected window cannot be resized."
         case .windowResizeFailed:
-            return "The selected window did not accept the new size. Refresh the list and try again."
+            return "The selected window did not accept the new size. Choose the window again and try again."
         case .targetApplicationUnavailable:
-            return "The selected window could not be matched for automation. Refresh the list and select it again."
+            return "The selected window could not be matched for resizing or automation. Choose the window again and try again."
         case .keyboardEventCreationFailed:
             return "The app could not create the keyboard event for the macro step."
         case .invalidAutomationCount:
             return "Automation capture count must be at least 1."
         case .automationMacroMissingCaptureStep:
             return "Add at least one Capture step to the macro flow before starting repeat capture."
+        case .windowPickerAlreadyActive:
+            return "A window picker is already open."
+        case .windowPickerCancelled:
+            return "Window selection was cancelled."
+        case .windowPickerSelectionUnavailable:
+            return "The selected content did not include a window. Choose a window and try again."
         }
     }
 }
@@ -66,6 +77,32 @@ final class WindowCaptureService {
     private let windowSizeMatchTolerance: CGFloat = 80
     private let windowCenterMatchTolerance: CGFloat = 140
     private let resizeVerificationTolerance: CGFloat = 2
+    private let pickerObserver = WindowPickerObserver()
+    private var pickerContinuation: CheckedContinuation<WindowInfo, Error>?
+    private var livePreviewSession: LiveWindowPreviewSession?
+    private var resizeTargetCache: [CGWindowID: WindowResizeTarget] = [:]
+
+    init() {
+        pickerObserver.didCancel = { [weak self] in
+            Task { @MainActor in
+                self?.finishWindowPicking(with: .failure(WindowCaptureError.windowPickerCancelled))
+            }
+        }
+
+        pickerObserver.didFail = { [weak self] error in
+            Task { @MainActor in
+                self?.finishWindowPicking(with: .failure(error))
+            }
+        }
+
+        pickerObserver.didUpdate = { [weak self] filter in
+            Task { @MainActor in
+                self?.handleWindowPickerSelection(filter)
+            }
+        }
+
+        SCContentSharingPicker.shared.add(pickerObserver)
+    }
 
     func hasScreenRecordingPermission() -> Bool {
         CGPreflightScreenCaptureAccess()
@@ -108,23 +145,80 @@ final class WindowCaptureService {
         NSWorkspace.shared.open(url)
     }
 
-    func fetchWindows() async throws -> [WindowInfo] {
+    func chooseWindow() async throws -> WindowInfo {
         guard hasScreenRecordingPermission() else {
             throw WindowCaptureError.permissionDenied
         }
 
+        guard pickerContinuation == nil else {
+            throw WindowCaptureError.windowPickerAlreadyActive
+        }
+
+        var configuration = SCContentSharingPickerConfiguration()
+        configuration.allowedPickerModes = [.singleWindow]
+        configuration.allowsChangingSelectedContent = false
+        configuration.excludedBundleIDs = [Bundle.main.bundleIdentifier].compactMap { $0 }
+
+        let picker = SCContentSharingPicker.shared
+        picker.defaultConfiguration = configuration
+        picker.isActive = true
+
+        return try await withCheckedThrowingContinuation { continuation in
+            pickerContinuation = continuation
+            picker.present()
+        }
+    }
+
+    func refreshWindow(_ window: WindowInfo) async throws -> WindowInfo {
         let shareableContent = try await SCShareableContent.excludingDesktopWindows(true, onScreenWindowsOnly: true)
 
-        let windows = shareableContent.windows
-            .filter { $0.windowLayer == 0 }
-            .map(WindowInfo.init(window:))
-            .sorted(by: sortWindows)
-
-        guard !windows.isEmpty else {
+        guard let refreshedWindow = shareableContent.windows.first(where: { $0.windowID == window.id }) else {
             throw WindowCaptureError.noWindowsAvailable
         }
 
-        return windows
+        return WindowInfo(window: refreshedWindow)
+    }
+
+    func startLivePreview(for window: WindowInfo, onFrame: @escaping @MainActor (NSImage) -> Void) async throws {
+        guard hasScreenRecordingPermission() else {
+            throw WindowCaptureError.permissionDenied
+        }
+
+        await stopLivePreview()
+
+        let filter = SCContentFilter(desktopIndependentWindow: window.rawWindow)
+        let configuration = SCStreamConfiguration()
+        let scale = max(CGFloat(filter.pointPixelScale), 1)
+        let maxPreviewWidth: CGFloat = 720
+        let sourceWidth = max(filter.contentRect.width * scale, 1)
+        let sourceHeight = max(filter.contentRect.height * scale, 1)
+        let outputScale = min(maxPreviewWidth / sourceWidth, 1)
+
+        configuration.width = max(Int(sourceWidth * outputScale), 1)
+        configuration.height = max(Int(sourceHeight * outputScale), 1)
+        configuration.minimumFrameInterval = CMTime(value: 1, timescale: 8)
+        configuration.pixelFormat = kCVPixelFormatType_32BGRA
+        configuration.queueDepth = 3
+        configuration.scalesToFit = true
+        configuration.showsCursor = false
+
+        let session = LiveWindowPreviewSession(
+            filter: filter,
+            configuration: configuration,
+            pointSize: filter.contentRect.size,
+            onFrame: onFrame
+        )
+        livePreviewSession = session
+        try await session.start()
+    }
+
+    func stopLivePreview() async {
+        guard let livePreviewSession else {
+            return
+        }
+
+        self.livePreviewSession = nil
+        await livePreviewSession.stop()
     }
 
     func captureAndSave(
@@ -259,8 +353,32 @@ final class WindowCaptureService {
             throw WindowCaptureError.accessibilityPermissionDenied
         }
 
-        let axWindow = try await focusTarget(window: window)
+        let resizeCandidates = try await resizeCandidates(for: window)
+        guard !resizeCandidates.isEmpty else {
+            throw WindowCaptureError.targetApplicationUnavailable
+        }
 
+        var sawUnsupportedWindow = false
+        for candidate in resizeCandidates {
+            do {
+                let appliedSize = try await resize(axWindow: candidate.element, to: size)
+                cacheResizeTarget(candidate, for: window)
+                return appliedSize
+            } catch WindowCaptureError.windowResizeUnavailable {
+                sawUnsupportedWindow = true
+            } catch WindowCaptureError.windowResizeFailed {
+                continue
+            }
+        }
+
+        if sawUnsupportedWindow {
+            throw WindowCaptureError.windowResizeUnavailable
+        }
+
+        throw WindowCaptureError.windowResizeFailed
+    }
+
+    private func resize(axWindow: AXUIElement, to size: CGSize) async throws -> CGSize {
         if let isResizable = copyBoolAttribute(axResizableAttribute, from: axWindow), !isResizable {
             throw WindowCaptureError.windowResizeUnavailable
         }
@@ -366,7 +484,7 @@ final class WindowCaptureService {
         runningApplication.activate(options: [.activateAllWindows])
         try await sleep(seconds: 0.4)
 
-        guard let axWindow = matchingAXWindow(for: window, pid: pid) else {
+        guard let axWindow = matchingAXWindowCandidate(for: window, pid: pid)?.element else {
             throw WindowCaptureError.targetApplicationUnavailable
         }
 
@@ -407,48 +525,141 @@ final class WindowCaptureService {
         keyUpEvent.postToPid(pid)
     }
 
-    private func matchingAXWindow(for window: WindowInfo, pid: pid_t) -> AXUIElement? {
-        let appElement = AXUIElementCreateApplication(pid)
-        let axWindows = copyAXWindowCandidates(from: appElement)
-
-        guard !axWindows.isEmpty else {
-            return nil
+    private func resizeCandidates(for window: WindowInfo) async throws -> [AXWindowMatchCandidate] {
+        guard
+            let pid = window.processID,
+            let runningApplication = NSRunningApplication(processIdentifier: pid)
+        else {
+            throw WindowCaptureError.targetApplicationUnavailable
         }
 
-        let expectedTitle = normalizedWindowTitle(window.rawWindow.title)
-        let expectedFrame = window.rawWindow.frame
+        runningApplication.activate(options: [.activateAllWindows])
+        try await sleep(seconds: 0.25)
 
-        let scoredWindows = axWindows.compactMap { axWindow -> AXWindowMatchCandidate? in
-            let candidate = AXWindowMatchCandidate(
-                element: axWindow,
-                title: normalizedWindowTitle(copyStringAttribute(kAXTitleAttribute as CFString, from: axWindow)),
-                frame: copyFrame(from: axWindow),
-                isMain: copyBoolAttribute(kAXMainAttribute as CFString, from: axWindow) == true,
-                isFocused: copyBoolAttribute(kAXFocusedAttribute as CFString, from: axWindow) == true,
-                isStandardWindow: copyStringAttribute(kAXSubroleAttribute as CFString, from: axWindow) == (kAXStandardWindowSubrole as String),
-                isResizable: copyBoolAttribute(axResizableAttribute, from: axWindow)
-            )
+        var candidates: [AXWindowMatchCandidate] = []
 
-            let score = score(axWindow: candidate, expectedTitle: expectedTitle, expectedFrame: expectedFrame)
-            guard score > 0 else {
-                return nil
+        if let cachedTarget = resizeTargetCache[window.id],
+           cachedTarget.processID == pid,
+           let cachedCandidate = candidate(from: cachedTarget.element, for: window) {
+            candidates.append(cachedCandidate.with(score: cachedCandidate.score + 200))
+        }
+
+        candidates.append(contentsOf: matchingAXWindowCandidates(for: window, pid: pid))
+
+        let highConfidenceCandidates = candidates
+            .filter { candidate in
+                candidate.score >= 30 ||
+                candidate.title == normalizedWindowTitle(window.title) ||
+                (candidate.isStandardWindow && candidate.frame != nil)
             }
+            .sorted(by: compareWindowCandidates(lhs:rhs:))
 
-            return candidate.with(score: score)
-        }
+        return uniqueWindowCandidates(highConfidenceCandidates)
+    }
+
+    private func matchingAXWindowCandidate(for window: WindowInfo, pid: pid_t) -> AXWindowMatchCandidate? {
+        let scoredWindows = matchingAXWindowCandidates(for: window, pid: pid)
 
         if let bestMatch = scoredWindows
             .sorted(by: compareWindowCandidates(lhs:rhs:))
             .first(where: { $0.score >= 30 }) {
-            return bestMatch.element
+            return bestMatch
         }
 
-        let standardWindows = scoredWindows.filter(\.isStandardWindow)
-        if standardWindows.count == 1 {
-            return standardWindows[0].element
+        if let fallbackWindow = singleEquivalentWindow(from: scoredWindows.filter(\.isStandardWindow)) {
+            return fallbackWindow
+        }
+
+        if let fallbackWindow = singleEquivalentWindow(from: scoredWindows) {
+            return fallbackWindow
         }
 
         return nil
+    }
+
+    private func matchingAXWindowCandidates(for window: WindowInfo, pid: pid_t) -> [AXWindowMatchCandidate] {
+        let appElement = AXUIElementCreateApplication(pid)
+        let axWindows = copyAXWindowCandidates(from: appElement)
+
+        guard !axWindows.isEmpty else {
+            return []
+        }
+
+        return axWindows.compactMap { axWindow in
+            candidate(from: axWindow, for: window)
+        }
+    }
+
+    private func candidate(from axWindow: AXUIElement, for window: WindowInfo) -> AXWindowMatchCandidate? {
+        let expectedTitle = normalizedWindowTitle(window.title)
+        let expectedFrame = window.rawWindow.frame
+        let candidate = AXWindowMatchCandidate(
+            element: axWindow,
+            title: normalizedWindowTitle(copyStringAttribute(kAXTitleAttribute as CFString, from: axWindow)),
+            frame: copyFrame(from: axWindow),
+            isMain: copyBoolAttribute(kAXMainAttribute as CFString, from: axWindow) == true,
+            isFocused: copyBoolAttribute(kAXFocusedAttribute as CFString, from: axWindow) == true,
+            isStandardWindow: copyStringAttribute(kAXSubroleAttribute as CFString, from: axWindow) == (kAXStandardWindowSubrole as String),
+            isResizable: copyBoolAttribute(axResizableAttribute, from: axWindow)
+        )
+        let score = score(axWindow: candidate, expectedTitle: expectedTitle, expectedFrame: expectedFrame)
+        return candidate.with(score: score)
+    }
+
+    private func cacheResizeTarget(_ candidate: AXWindowMatchCandidate, for window: WindowInfo) {
+        guard let processID = window.processID else {
+            return
+        }
+
+        resizeTargetCache[window.id] = WindowResizeTarget(
+            element: candidate.element,
+            processID: processID
+        )
+    }
+
+    private func uniqueWindowCandidates(_ candidates: [AXWindowMatchCandidate]) -> [AXWindowMatchCandidate] {
+        var uniqueCandidates: [AXWindowMatchCandidate] = []
+
+        for candidate in candidates {
+            if !uniqueCandidates.contains(where: { existingCandidate in
+                axWindow(existingCandidate, isEquivalentTo: candidate)
+            }) {
+                uniqueCandidates.append(candidate)
+            }
+        }
+
+        return uniqueCandidates
+    }
+
+    private func singleEquivalentWindow(from candidates: [AXWindowMatchCandidate]) -> AXWindowMatchCandidate? {
+        guard let firstCandidate = candidates.first else {
+            return nil
+        }
+
+        let equivalentCandidates = candidates.filter { candidate in
+            axWindow(candidate, isEquivalentTo: firstCandidate)
+        }
+
+        guard equivalentCandidates.count == candidates.count else {
+            return nil
+        }
+
+        return firstCandidate
+    }
+
+    private func axWindow(_ lhs: AXWindowMatchCandidate, isEquivalentTo rhs: AXWindowMatchCandidate) -> Bool {
+        if lhs.title != rhs.title {
+            return false
+        }
+
+        switch (lhs.frame, rhs.frame) {
+        case (.some(let lhsFrame), .some(let rhsFrame)):
+            return approximatelyEqual(lhsFrame, rhsFrame, tolerance: 2)
+        case (.none, .none):
+            return true
+        default:
+            return false
+        }
     }
 
     private func copyAXWindowCandidates(from appElement: AXUIElement) -> [AXUIElement] {
@@ -622,7 +833,8 @@ final class WindowCaptureService {
         if !expectedTitle.isEmpty {
             if candidate.title == expectedTitle {
                 score += 70
-            } else if candidate.title.contains(expectedTitle) || expectedTitle.contains(candidate.title) {
+            } else if !candidate.title.isEmpty,
+                      candidate.title.contains(expectedTitle) || expectedTitle.contains(candidate.title) {
                 score += 35
             }
         }
@@ -771,17 +983,122 @@ final class WindowCaptureService {
         return cleaned.nilIfEmpty ?? "window"
     }
 
-    private func sortWindows(lhs: WindowInfo, rhs: WindowInfo) -> Bool {
-        if lhs.isActive != rhs.isActive {
-            return lhs.isActive && !rhs.isActive
+    private func handleWindowPickerSelection(_ filter: SCContentFilter) {
+        guard filter.style == .window, let selectedWindow = filter.includedWindows.first else {
+            finishWindowPicking(with: .failure(WindowCaptureError.windowPickerSelectionUnavailable))
+            return
         }
 
-        if lhs.appName != rhs.appName {
-            return lhs.appName.localizedCaseInsensitiveCompare(rhs.appName) == .orderedAscending
-        }
-
-        return lhs.title.localizedCaseInsensitiveCompare(rhs.title) == .orderedAscending
+        finishWindowPicking(with: .success(WindowInfo(window: selectedWindow)))
     }
+
+    private func finishWindowPicking(with result: Result<WindowInfo, Error>) {
+        guard let pickerContinuation else {
+            return
+        }
+
+        self.pickerContinuation = nil
+        SCContentSharingPicker.shared.isActive = false
+
+        switch result {
+        case .success(let window):
+            pickerContinuation.resume(returning: window)
+        case .failure(let error):
+            pickerContinuation.resume(throwing: error)
+        }
+    }
+}
+
+private final class WindowPickerObserver: NSObject, SCContentSharingPickerObserver {
+    var didCancel: (() -> Void)?
+    var didFail: ((Error) -> Void)?
+    var didUpdate: ((SCContentFilter) -> Void)?
+
+    func contentSharingPicker(_ picker: SCContentSharingPicker, didCancelFor stream: SCStream?) {
+        didCancel?()
+    }
+
+    func contentSharingPicker(_ picker: SCContentSharingPicker, didUpdateWith filter: SCContentFilter, for stream: SCStream?) {
+        didUpdate?(filter)
+    }
+
+    func contentSharingPickerStartDidFailWithError(_ error: Error) {
+        didFail?(error)
+    }
+}
+
+private final class LiveWindowPreviewSession: NSObject, SCStreamOutput, SCStreamDelegate {
+    private let stream: SCStream
+    private let outputQueue = DispatchQueue(label: "dev.CCS.CaptureInPicture.live-preview")
+    private let ciContext = CIContext()
+    private let pointSize: CGSize
+    private let onFrame: @MainActor (NSImage) -> Void
+    private var isRunning = false
+
+    init(
+        filter: SCContentFilter,
+        configuration: SCStreamConfiguration,
+        pointSize: CGSize,
+        onFrame: @escaping @MainActor (NSImage) -> Void
+    ) {
+        stream = SCStream(filter: filter, configuration: configuration, delegate: nil)
+        self.pointSize = pointSize
+        self.onFrame = onFrame
+        super.init()
+    }
+
+    func start() async throws {
+        try stream.addStreamOutput(self, type: .screen, sampleHandlerQueue: outputQueue)
+        try await stream.startCapture()
+        isRunning = true
+    }
+
+    func stop() async {
+        guard isRunning else {
+            return
+        }
+
+        isRunning = false
+        try? await stream.stopCapture()
+        try? stream.removeStreamOutput(self, type: .screen)
+    }
+
+    func stream(_ stream: SCStream, didOutputSampleBuffer sampleBuffer: CMSampleBuffer, of type: SCStreamOutputType) {
+        guard
+            type == .screen,
+            sampleBuffer.isValid,
+            frameStatus(from: sampleBuffer) == .complete,
+            let imageBuffer = sampleBuffer.imageBuffer
+        else {
+            return
+        }
+
+        let ciImage = CIImage(cvImageBuffer: imageBuffer)
+        guard let cgImage = ciContext.createCGImage(ciImage, from: ciImage.extent) else {
+            return
+        }
+
+        let pointSize = pointSize
+        Task { @MainActor [onFrame] in
+            onFrame(NSImage(cgImage: cgImage, size: pointSize))
+        }
+    }
+
+    private func frameStatus(from sampleBuffer: CMSampleBuffer) -> SCFrameStatus? {
+        guard
+            let attachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, createIfNecessary: false) as? [[SCStreamFrameInfo: Any]],
+            let rawStatus = attachments.first?[SCStreamFrameInfo.status] as? Int
+        else {
+            return nil
+        }
+
+        return SCFrameStatus(rawValue: rawStatus)
+    }
+}
+
+private struct WindowResizeTarget {
+    let element: AXUIElement
+    let processID: pid_t
 }
 
 private struct AXWindowMatchCandidate {

@@ -9,8 +9,8 @@ struct SettingsGeneralTab: View {
                 SettingsPermissionRow(
                     title: "Screen Recording",
                     isEnabled: viewModel.hasPermission,
-                    readyText: "Ready to list and capture windows.",
-                    missingText: "Required to see other app windows."
+                    readyText: "Ready to choose and capture windows.",
+                    missingText: "Required to use the macOS window picker."
                 )
 
                 SettingsPermissionRow(

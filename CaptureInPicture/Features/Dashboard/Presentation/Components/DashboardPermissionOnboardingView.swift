@@ -173,7 +173,7 @@ struct DashboardPermissionOnboardingView: View {
     private func description(for step: ContentViewModel.PermissionOnboardingStep) -> String {
         switch step {
         case .screenRecording:
-            return "Needed to list running windows and save screenshots from the one you choose."
+            return "Needed to show the macOS window picker and save screenshots from the window you choose."
         case .accessibility:
             return "Needed for repeat capture macros and window resizing so the app can focus another window and send key input."
         case .notifications:
@@ -188,7 +188,7 @@ struct DashboardPermissionOnboardingView: View {
         case .screenRecording:
             return [
                 viewModel.hasPermission
-                    ? "macOS already recognizes this app for Screen Recording, so the window list can load immediately."
+                    ? "macOS already recognizes this app for Screen Recording, so the system window picker can open immediately."
                     : "Tap the request button to trigger the macOS prompt instead of surprising the user with it on the main screen.",
                 "If you already denied it once, use System Settings to enable the toggle and return here.",
                 "When permission is active, the next step becomes available automatically."
@@ -212,7 +212,7 @@ struct DashboardPermissionOnboardingView: View {
         case .ready:
             return [
                 "The dashboard will now open with the selected permissions reflected in the status banner and controls.",
-                "If Screen Recording was just enabled, refreshing the window list should show capturable windows right away.",
+                "If Screen Recording was just enabled, use 창 선택하기 to open the macOS window picker.",
                 "You can reopen guided setup later whenever you want from the permission banner."
             ]
         }
