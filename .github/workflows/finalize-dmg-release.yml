@@ -1,0 +1,179 @@
+name: Finalize DMG Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to upload the notarized DMG to
+        required: true
+        type: string
+      build_run_id:
+        description: Run ID from the Release DMG workflow that submitted notarization
+        required: true
+        type: string
+      submission_id:
+        description: Optional notarization submission ID. Defaults to the ID saved in the build artifact.
+        required: false
+        type: string
+
+permissions:
+  actions: read
+  contents: write
+
+jobs:
+  finalize-dmg:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    env:
+      APP_NAME: CaptureInPicture
+      APP_STORE_CONNECT_KEY_ID: ${{ secrets.APP_STORE_CONNECT_KEY_ID }}
+      APP_STORE_CONNECT_ISSUER_ID: ${{ secrets.APP_STORE_CONNECT_ISSUER_ID }}
+      APP_STORE_CONNECT_PRIVATE_KEY: ${{ secrets.APP_STORE_CONNECT_PRIVATE_KEY }}
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+    steps:
+      - name: Resolve release inputs
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          release_tag="${{ inputs.tag }}"
+          release_version="${release_tag#v}"
+
+          echo "tag=$release_tag" >> "$GITHUB_OUTPUT"
+          echo "version=$release_version" >> "$GITHUB_OUTPUT"
+          echo "artifact_name=release-dmg-$release_version" >> "$GITHUB_OUTPUT"
+
+      - name: Validate secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          required_vars=(
+            APP_STORE_CONNECT_KEY_ID
+            APP_STORE_CONNECT_ISSUER_ID
+            APP_STORE_CONNECT_PRIVATE_KEY
+          )
+
+          for var_name in "${required_vars[@]}"; do
+            if [[ -z "${!var_name:-}" ]]; then
+              echo "Missing required secret: ${var_name}" >&2
+              exit 1
+            fi
+          done
+
+      - name: Restore App Store Connect API key
+        id: api-key
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          api_key_path="$RUNNER_TEMP/AuthKey_${APP_STORE_CONNECT_KEY_ID}.p8"
+          printf '%s' "$APP_STORE_CONNECT_PRIVATE_KEY" > "$api_key_path"
+          chmod 600 "$api_key_path"
+
+          echo "path=$api_key_path" >> "$GITHUB_OUTPUT"
+
+      - name: Download submitted DMG artifact
+        id: artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          artifact_dir="$RUNNER_TEMP/release-dmg-artifact"
+          mkdir -p "$artifact_dir"
+
+          gh run download "${{ inputs.build_run_id }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --name "${{ steps.release.outputs.artifact_name }}" \
+            --dir "$artifact_dir"
+
+          dmg_path="$(find "$artifact_dir" -type f -name "${APP_NAME}-${{ steps.release.outputs.version }}.dmg" | head -n 1)"
+          saved_submission_id="$(find "$artifact_dir" -type f -name "notarization-submission-id.txt" -exec cat {} \; | head -n 1)"
+          input_submission_id="${{ inputs.submission_id }}"
+          submission_id="${input_submission_id:-$saved_submission_id}"
+
+          if [[ -z "$dmg_path" ]]; then
+            echo "Could not find ${APP_NAME}-${{ steps.release.outputs.version }}.dmg in artifact ${{ steps.release.outputs.artifact_name }}." >&2
+            exit 1
+          fi
+
+          if [[ -z "$submission_id" ]]; then
+            echo "Could not determine notarization submission id." >&2
+            exit 1
+          fi
+
+          echo "dmg_path=$dmg_path" >> "$GITHUB_OUTPUT"
+          echo "submission_id=$submission_id" >> "$GITHUB_OUTPUT"
+
+      - name: Verify release exists
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release view "${{ steps.release.outputs.tag }}" --repo "$GITHUB_REPOSITORY" >/dev/null
+
+      - name: Confirm notarization was accepted
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          submission_id="${{ steps.artifact.outputs.submission_id }}"
+          status_json="$RUNNER_TEMP/notary-status.json"
+
+          xcrun notarytool info "$submission_id" \
+            --key "${{ steps.api-key.outputs.path }}" \
+            --key-id "$APP_STORE_CONNECT_KEY_ID" \
+            --issuer "$APP_STORE_CONNECT_ISSUER_ID" \
+            --output-format json \
+            > "$status_json"
+
+          cat "$status_json"
+
+          status="$(ruby -rjson -e 'data = JSON.parse(File.read(ARGV[0])); print(data["status"] || data["Status"] || "")' "$status_json")"
+          message="$(ruby -rjson -e 'data = JSON.parse(File.read(ARGV[0])); print(data["statusSummary"] || data["message"] || data["Status Summary"] || "")' "$status_json")"
+
+          echo "Notarization status: ${status:-unknown}${message:+ - $message}"
+
+          if [[ "$status" == "Accepted" ]]; then
+            exit 0
+          fi
+
+          if [[ "$status" == "Invalid" || "$status" == "Rejected" ]]; then
+            echo "Fetching notarization log for $submission_id"
+            xcrun notarytool log "$submission_id" \
+              --key "${{ steps.api-key.outputs.path }}" \
+              --key-id "$APP_STORE_CONNECT_KEY_ID" \
+              --issuer "$APP_STORE_CONNECT_ISSUER_ID" \
+              || true
+          fi
+
+          echo "Notarization is not accepted yet. Re-run this workflow after Apple finishes processing." >&2
+          exit 1
+
+      - name: Staple and validate DMG
+        id: notarized-dmg
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          dmg_path="${{ steps.artifact.outputs.dmg_path }}"
+          checksum_path="${dmg_path}.sha256"
+
+          xcrun stapler staple "$dmg_path"
+          xcrun stapler validate "$dmg_path"
+          spctl -a -vv -t open "$dmg_path"
+          shasum -a 256 "$dmg_path" > "$checksum_path"
+
+          echo "checksum_path=$checksum_path" >> "$GITHUB_OUTPUT"
+
+      - name: Upload release assets
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          gh release upload "${{ steps.release.outputs.tag }}" \
+            "${{ steps.artifact.outputs.dmg_path }}" \
+            "${{ steps.notarized-dmg.outputs.checksum_path }}" \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber
