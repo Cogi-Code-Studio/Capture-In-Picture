@@ -179,20 +179,12 @@ jobs:
           set -euo pipefail
 
           release_version="${{ steps.release.outputs.version }}"
-          dmg_root="$RUNNER_TEMP/dmg-root"
           dmg_path="$RUNNER_TEMP/${APP_NAME}-${release_version}.dmg"
 
-          rm -rf "$dmg_root"
-          mkdir -p "$dmg_root"
-          cp -R "${{ steps.export.outputs.app_path }}" "$dmg_root/"
-          ln -s /Applications "$dmg_root/Applications"
-
-          hdiutil create \
-            -volname "$APP_DISPLAY_NAME" \
-            -srcfolder "$dmg_root" \
-            -ov \
-            -format UDZO \
-            "$dmg_path"
+          scripts/create-dmg-installer.sh \
+            "${{ steps.export.outputs.app_path }}" \
+            "$dmg_path" \
+            "$APP_DISPLAY_NAME"
 
           echo "path=$dmg_path" >> "$GITHUB_OUTPUT"
           echo "asset_name=$(basename "$dmg_path")" >> "$GITHUB_OUTPUT"

@@ -179,7 +179,6 @@ fi
 TEMP_DIR="$(mktemp -d "${TMPDIR:-/tmp}/capture-in-picture-release.XXXXXX")"
 ARCHIVE_PATH="$TEMP_DIR/${APP_NAME}.xcarchive"
 EXPORT_PATH="$TEMP_DIR/export"
-DMG_ROOT="$TEMP_DIR/dmg-root"
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -214,17 +213,8 @@ APP_PATH="$EXPORT_PATH/${APP_NAME}.app"
 printf '\n==> Verifying app signature\n'
 codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 
-printf '\n==> Creating DMG\n'
-mkdir -p "$DMG_ROOT"
-cp -R "$APP_PATH" "$DMG_ROOT/"
-ln -s /Applications "$DMG_ROOT/Applications"
-
-hdiutil create \
-  -volname "$APP_DISPLAY_NAME" \
-  -srcfolder "$DMG_ROOT" \
-  -ov \
-  -format UDZO \
-  "$DMG_PATH"
+printf '\n==> Creating drag-and-drop DMG\n'
+"$ROOT_DIR/scripts/create-dmg-installer.sh" "$APP_PATH" "$DMG_PATH" "$APP_DISPLAY_NAME"
 
 if [[ "$SKIP_NOTARIZE" == "0" ]]; then
   printf '\n==> Submitting DMG for notarization\n'
@@ -302,4 +292,3 @@ fi
 printf '\nDone.\n'
 printf 'DMG: %s\n' "$DMG_PATH"
 printf 'Checksum: %s\n' "$CHECKSUM_PATH"
-
