@@ -246,10 +246,9 @@ jobs:
             echo "### Notarization submitted"
             echo ""
             echo "- Release tag: \`${{ steps.release.outputs.tag }}\`"
-            echo "- Build run id: \`$GITHUB_RUN_ID\`"
             echo "- Submission id: \`$submission_id\`"
             echo ""
-            echo "After Apple accepts the submission, run **Finalize DMG Release** with this tag and build run id."
+            echo "After Apple accepts the submission, run **Finalize DMG Release** with this tag."
           } >> "$GITHUB_STEP_SUMMARY"
 
           echo "dir=$artifact_dir" >> "$GITHUB_OUTPUT"

@@ -7,10 +7,6 @@ on:
         description: Existing release tag to upload the notarized DMG to
         required: true
         type: string
-      build_run_id:
-        description: Run ID from the Release DMG workflow that submitted notarization
-        required: true
-        type: string
       submission_id:
         description: Optional notarization submission ID. Defaults to the ID saved in the build artifact.
         required: false
@@ -84,9 +80,9 @@ jobs:
           artifact_dir="$RUNNER_TEMP/release-dmg-artifact"
           mkdir -p "$artifact_dir"
 
-          gh run download "${{ inputs.build_run_id }}" \
-            --repo "$GITHUB_REPOSITORY" \
+          gh run download \
             --name "${{ steps.release.outputs.artifact_name }}" \
+            --repo "$GITHUB_REPOSITORY" \
             --dir "$artifact_dir"
 
           dmg_path="$(find "$artifact_dir" -type f -name "${APP_NAME}-${{ steps.release.outputs.version }}.dmg" | head -n 1)"
