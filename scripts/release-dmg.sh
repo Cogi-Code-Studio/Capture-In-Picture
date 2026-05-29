@@ -216,6 +216,10 @@ codesign --verify --deep --strict --verbose=2 "$APP_PATH"
 printf '\n==> Creating drag-and-drop DMG\n'
 "$ROOT_DIR/scripts/create-dmg-installer.sh" "$APP_PATH" "$DMG_PATH" "$APP_DISPLAY_NAME"
 
+printf '\n==> Signing DMG\n'
+codesign --force --sign "$DEVELOPER_ID_IDENTITY" "$DMG_PATH"
+codesign --verify --verbose=2 "$DMG_PATH"
+
 if [[ "$SKIP_NOTARIZE" == "0" ]]; then
   printf '\n==> Submitting DMG for notarization\n'
   SUBMISSION_JSON="$TEMP_DIR/notary-submit.json"

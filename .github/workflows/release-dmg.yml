@@ -186,6 +186,12 @@ jobs:
             "$dmg_path" \
             "$APP_DISPLAY_NAME"
 
+          codesign --force \
+            --sign "${{ steps.keychain.outputs.identity }}" \
+            --keychain "${{ steps.keychain.outputs.path }}" \
+            "$dmg_path"
+          codesign --verify --verbose=2 "$dmg_path"
+
           echo "path=$dmg_path" >> "$GITHUB_OUTPUT"
           echo "asset_name=$(basename "$dmg_path")" >> "$GITHUB_OUTPUT"
 
