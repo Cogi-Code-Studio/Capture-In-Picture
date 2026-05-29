@@ -275,7 +275,7 @@ if [[ "$SKIP_NOTARIZE" == "0" ]]; then
   printf '\n==> Stapling and validating DMG\n'
   xcrun stapler staple "$DMG_PATH"
   xcrun stapler validate "$DMG_PATH"
-  spctl -a -vv -t open "$DMG_PATH"
+  spctl -a -vv -t open --context context:primary-signature "$DMG_PATH"
 else
   printf '\n==> Skipping notarization as requested\n'
 fi

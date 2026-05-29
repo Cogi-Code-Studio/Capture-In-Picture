@@ -158,7 +158,7 @@ jobs:
 
           xcrun stapler staple "$dmg_path"
           xcrun stapler validate "$dmg_path"
-          spctl -a -vv -t open "$dmg_path"
+          spctl -a -vv -t open --context context:primary-signature "$dmg_path"
           shasum -a 256 "$dmg_path" > "$checksum_path"
 
           echo "checksum_path=$checksum_path" >> "$GITHUB_OUTPUT"
